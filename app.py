@@ -206,8 +206,22 @@ if run:
             "risk_flags": "; ".join(flags)
         })
 
-    df = pd.DataFrame(rows).sort_values("overall_score", ascending=False)
-    st.subheader("✅ Shortlist (sorted by overall_score)")
+    df = pd.DataFrame(rows)
+
+if df.empty:
+    st.warning("No products returned from Rainforest. Try a different category_id, or reduce scan size, then click Run scan again.")
+    st.stop()
+
+# Sort safely (even if overall_score isn't present)
+if "overall_score" in df.columns:
+    df = df.sort_values("overall_score", ascending=False)
+else:
+    # fallback: sort by any score-like column if present
+    for c in ["score", "opportunity_score", "total_score", "ai_score"]:
+        if c in df.columns:
+            df = df.sort_values(c, ascending=False)
+            break
+            st.subheader("✅ Shortlist (sorted by overall_score)")
     st.dataframe(df, use_container_width=True)
 
     st.download_button(
