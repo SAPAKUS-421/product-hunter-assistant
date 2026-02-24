@@ -137,12 +137,6 @@ st.caption(
     "and generate sourcing leads. (Optional AI review-gap insights.)"
 )
 
-with st.expander("✅ What the 'Install' button is"):
-    st.write(
-        "That **Install** button is from your browser (Chrome/Edge). It lets you install this page as a desktop-style app "
-        "(a shortcut / PWA). **Completely optional**. You can ignore it safely."
-    )
-
 # Sidebar controls
 st.sidebar.header("A) Source")
 amazon_domain = st.sidebar.selectbox("Amazon domain", ["amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de"], index=0)
