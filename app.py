@@ -206,22 +206,33 @@ if run:
             "risk_flags": "; ".join(flags)
         })
 
-    df = pd.DataFrame(rows)
+    # ---- RESULTS BUILD (safe) ----
+df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
 if df.empty:
-    st.warning("No products returned from Rainforest. Try a different category_id, or reduce scan size, then click Run scan again.")
+    st.warning("No products returned. Try another category_id or reduce scan size, then click Run scan again.")
+    st.session_state["last_df"] = None
     st.stop()
 
-# Sort safely (even if overall_score isn't present)
+# Sort safely
 if "overall_score" in df.columns:
     df = df.sort_values("overall_score", ascending=False)
 else:
-    # fallback: sort by any score-like column if present
+    # fallback: if your code uses some other score column
     for c in ["score", "opportunity_score", "total_score", "ai_score"]:
         if c in df.columns:
             df = df.sort_values(c, ascending=False)
             break
-            st.subheader("✅ Shortlist (sorted by overall_score)")
+
+st.session_state["last_df"] = df
+# ---- DISPLAY (safe) ----
+if st.session_state.get("last_df") is not None:
+    st.subheader("Shortlist")
+    st.dataframe(st.session_state["last_df"], use_container_width=True)
+else:
+    st.info("Click 'Run scan' to generate results.")
+    
+        st.subheader("✅ Shortlist (sorted by overall_score)")
     st.dataframe(df, use_container_width=True)
 
     st.download_button(
