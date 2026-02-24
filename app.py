@@ -1,561 +1,428 @@
-import math
 import os
-import re
-from typing import Any, Dict, List, Optional, Tuple
+import math
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
 
+# Optional AI (won't break if openai isn't installed)
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-# =========================
-# Helpers: Secrets + Safety
-# =========================
 
+# -----------------------------
+# Page config
+# -----------------------------
+st.set_page_config(page_title="Product Hunter Assistant (USA Market)", layout="wide")
+
+
+# -----------------------------
+# Secrets helpers
+# -----------------------------
 def get_secret(key: str, default: str = "") -> str:
-    """Fetch from Streamlit secrets first, then env vars."""
+    """Reads Streamlit Secrets first, then environment variables."""
     try:
-        val = str(st.secrets.get(key, default)).strip()
+        if key in st.secrets:
+            return str(st.secrets.get(key, default)).strip()
     except Exception:
-        val = str(os.getenv(key, default)).strip()
-    return val
+        pass
+    return str(os.getenv(key, default)).strip()
 
 
-RAINFOREST_API_KEY = get_secret("RAINFOREST_API_KEY", "")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY", "")
+RAINFOREST_API_KEY = get_secret("RAINFOREST_API_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
 
-def _safe_get(d: Dict[str, Any], *keys: str, default=None):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict) or k not in cur:
-            return default
-        cur = cur[k]
-    return cur
+# -----------------------------
+# Rainforest API helpers
+# -----------------------------
+RF_ENDPOINT = "https://api.rainforestapi.com/request"
 
 
-def _to_float(x: Any) -> Optional[float]:
-    if x is None:
-        return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    s = str(x)
-    s = re.sub(r"[^\d.]", "", s)
-    try:
-        return float(s) if s else None
-    except Exception:
-        return None
+def rf_get(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Safe Rainforest API GET with good error messages."""
+    if not RAINFOREST_API_KEY:
+        raise RuntimeError("Missing RAINFOREST_API_KEY in Streamlit Secrets.")
 
+    params = dict(params)
+    params["api_key"] = RAINFOREST_API_KEY
 
-# =========================
-# Rainforest API
-# =========================
-
-RAINFOREST_ENDPOINT = "https://api.rainforestapi.com/request"
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def rf_bestsellers(amazon_domain: str, category_id: str, api_key: str) -> Dict[str, Any]:
-    params = {
-        "api_key": api_key,
-        "type": "bestsellers",
-        "amazon_domain": amazon_domain,
-        "category_id": category_id,
-    }
-    r = requests.get(RAINFOREST_ENDPOINT, params=params, timeout=45)
+    r = requests.get(RF_ENDPOINT, params=params, timeout=45)
+    # Helpful error text on 401
+    if r.status_code == 401:
+        raise RuntimeError(
+            "Rainforest returned 401 Unauthorized. Your RAINFOREST_API_KEY is missing/incorrect, "
+            "or you pasted the placeholder text."
+        )
     r.raise_for_status()
     return r.json()
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def rf_reviews(amazon_domain: str, asin: str, api_key: str, limit: int = 40) -> Dict[str, Any]:
-    params = {
-        "api_key": api_key,
-        "type": "reviews",
-        "amazon_domain": amazon_domain,
-        "asin": asin,
-        "sort_by": "most_recent",
-        "review_stars": "all_critical",
-        "max_page": 1,  # Rainforest handles paging; keep it light
-    }
-    r = requests.get(RAINFOREST_ENDPOINT, params=params, timeout=45)
-    r.raise_for_status()
-    data = r.json()
-    # Keep it bounded
-    if isinstance(data.get("reviews"), list):
-        data["reviews"] = data["reviews"][:limit]
-    return data
-
-
-def parse_bestsellers(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    items = data.get("bestsellers") or data.get("best_sellers") or []
-    if not isinstance(items, list):
-        return []
-    out = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        out.append(it)
-    return out
-
-
-def extract_price(item: Dict[str, Any]) -> Optional[float]:
-    # Rainforest sometimes uses price.value or price.raw / current_price.value
-    candidates = [
-        _safe_get(item, "price", "value"),
-        _safe_get(item, "price", "raw"),
-        _safe_get(item, "current_price", "value"),
-        _safe_get(item, "current_price", "raw"),
-        item.get("price"),
-        item.get("current_price"),
-    ]
-    for c in candidates:
-        v = _to_float(c)
-        if v is not None and v > 0:
-            return v
+def parse_price_value(obj: Any) -> Optional[float]:
+    """
+    Rainforest sometimes returns price like:
+      price: { value: 19.99, currency: 'USD' }
+    or other shapes. We'll try common patterns.
+    """
+    try:
+        if obj is None:
+            return None
+        if isinstance(obj, (int, float)):
+            return float(obj)
+        if isinstance(obj, dict):
+            for k in ["value", "raw", "amount"]:
+                if k in obj and obj[k] is not None:
+                    return float(str(obj[k]).replace("$", "").strip())
+        if isinstance(obj, str):
+            return float(obj.replace("$", "").strip())
+    except Exception:
+        return None
     return None
 
 
-def extract_rating_reviews(item: Dict[str, Any]) -> Tuple[Optional[float], Optional[int]]:
-    rating = _to_float(item.get("rating") or _safe_get(item, "rating", "value"))
-    reviews = item.get("ratings_total") or item.get("reviews_total") or item.get("total_reviews")
-    try:
-        reviews_int = int(str(reviews).replace(",", "")) if reviews is not None else None
-    except Exception:
-        reviews_int = None
-    return rating, reviews_int
+def safe_get(d: Dict[str, Any], path: List[str], default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
 
 
-# =========================
-# Scoring (Product Hunting)
-# =========================
+# -----------------------------
+# AI helper (optional)
+# -----------------------------
+def ai_gap_analysis(product_title: str, critical_text: str) -> str:
+    """Summarize top complaints + improvement blueprint."""
+    if not OPENAI_API_KEY:
+        return "OpenAI key missing. Add OPENAI_API_KEY in Secrets to enable AI insights."
+    if OpenAI is None:
+        return "openai package not installed. Add 'openai' to requirements.txt to enable AI insights."
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def normalize_log(x: float, x_min: float, x_max: float) -> float:
-    """0..1 log normalization."""
-    x = clamp(x, x_min, x_max)
-    a = math.log1p(x_min)
-    b = math.log1p(x_max)
-    return 0.0 if b == a else (math.log1p(x) - a) / (b - a)
-
-
-def demand_score(rank: Optional[int], rating: Optional[float], reviews: Optional[int]) -> float:
-    # Lower rank = more demand. Use log scaling.
-    if rank is None:
-        r = 0.35
-    else:
-        # rank 1..100000 -> map (1 high demand)
-        r = 1.0 - normalize_log(rank, 1, 100000)
-
-    rat = 0.55 if rating is None else clamp((rating - 3.0) / 2.0, 0.0, 1.0)  # 3.0->0, 5.0->1
-    rev = 0.45 if reviews is None else normalize_log(reviews, 1, 50000)
-
-    # Weighted: rank most important
-    return clamp(0.55 * r + 0.25 * rat + 0.20 * rev, 0.0, 1.0) * 100.0
-
-
-def competition_score(reviews: Optional[int], rating: Optional[float]) -> float:
-    """
-    Higher score = easier competition (we want LOW entrenched review moat).
-    Fewer reviews generally = less entrenched competition.
-    """
-    if reviews is None:
-        rev_moat = 0.55
-    else:
-        # 1..50000 -> moat strength
-        moat = normalize_log(reviews, 1, 50000)  # 0 low moat, 1 high moat
-        rev_moat = 1.0 - moat
-
-    # Very high rating can indicate strong incumbents; slightly lower might be opportunity.
-    if rating is None:
-        rat_opportunity = 0.55
-    else:
-        rat_opportunity = 1.0 - clamp((rating - 4.2) / 0.8, 0.0, 1.0)  # 4.2..5.0 -> incumbency
-
-    return clamp(0.75 * rev_moat + 0.25 * rat_opportunity, 0.0, 1.0) * 100.0
-
-
-def profit_math(
-    sell_price: float,
-    buy_cost: float,
-    fee_pct: float,
-    fee_fixed: float,
-    ship_cost: float,
-    pack_cost: float,
-    misc_cost: float,
-) -> Tuple[float, float]:
-    fees = (sell_price * (fee_pct / 100.0)) + fee_fixed
-    profit = sell_price - (buy_cost + fees + ship_cost + pack_cost + misc_cost)
-    margin = 0.0 if sell_price <= 0 else (profit / sell_price) * 100.0
-    return profit, margin
-
-
-def profit_score(profit: float, margin_pct: float) -> float:
-    """
-    0..100
-    - reward positive profit and healthy margins
-    - penalize negative profit hard
-    """
-    if profit <= 0:
-        return clamp(20 + profit, 0, 25)  # negative profit drives score down
-    # profit $: 0..20, margin%: 0..40 typical
-    p = clamp(profit / 20.0, 0.0, 1.0)
-    m = clamp(margin_pct / 40.0, 0.0, 1.0)
-    return clamp((0.55 * p + 0.45 * m) * 100.0, 0.0, 100.0)
-
-
-def overall_score(demand: float, profit_s: float, competition: float) -> float:
-    # Demand + Profit heavy; Competition as tie-breaker.
-    return clamp(0.45 * demand + 0.40 * profit_s + 0.15 * competition, 0.0, 100.0)
-
-
-# =========================
-# Optional OpenAI (AI Gap Analysis)
-# =========================
-
-def openai_analyze(product_title: str, critical_reviews: List[str], model: str) -> str:
-    """
-    Works with both new OpenAI python SDK and legacy openai.
-    If OpenAI is not configured or fails, returns a readable error string.
-    """
-    text = "\n\n".join([f"- {t[:600]}" for t in critical_reviews[:18]])
     prompt = f"""
-You are a ruthless product researcher focused on USA marketplace selling.
+You are a practical product research assistant for USA e-commerce resellers.
 
 Product: {product_title}
 
-Below are recent CRITICAL reviews. Extract actionable insights for improving or differentiating:
-{text}
+Critical feedback snippets:
+{critical_text}
 
 Return:
-1) Top 5 complaints (very specific).
-2) "Opportunity blueprint" (what exact improvements to make).
-3) Packaging / bundling ideas for higher AOV.
-4) Biggest risk flags (returns, breakage, compliance, IP, gating).
-Keep it concise, structured, and practical.
+1) Top 3 specific complaints (bullet points).
+2) A simple 'better product blueprint' (bullet points).
+3) Any red flags for reselling (brand gating / safety / compliance) in 1-2 bullets.
+Keep it short and actionable.
 """.strip()
 
-    # Try new SDK first
-    try:
-        from openai import OpenAI  # type: ignore
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=700,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        pass
-
-    # Fallback: legacy SDK
-    try:
-        import openai  # type: ignore
-        openai.api_key = OPENAI_API_KEY
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=700,
-        )
-        return resp["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"AI analysis failed: {e}"
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4,
+    )
+    return resp.choices[0].message.content.strip()
 
 
-# =========================
+# -----------------------------
 # UI
-# =========================
-
-st.set_page_config(page_title="Product Hunter Assistant (USA)", layout="wide")
-
+# -----------------------------
 st.title("🧭 Product Hunter Assistant (USA Market)")
 st.caption(
-    "Pull Amazon bestsellers via Rainforest, score opportunities for resale/wholesale, and (optionally) extract gaps from critical reviews."
+    "Pull Amazon bestsellers via Rainforest, score opportunities for resale/wholesale, "
+    "and generate sourcing leads. (Optional AI review-gap insights.)"
 )
 
-with st.sidebar:
-    st.header("A) Source")
-    amazon_domain = st.selectbox("Amazon domain", ["amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de"], index=0)
-    category_id = st.text_input("Rainforest category_id", value="electronics", help="Example: electronics, home_and_kitchen, toys_and_games (depends on Rainforest).")
-    scan_n = st.slider("How many bestsellers to scan", min_value=5, max_value=60, value=15, step=1)
-
-    st.divider()
-    st.header("B) Selling assumptions")
-    sell_price_mode = st.selectbox(
-        "Selling price for profit math",
-        ["Use Amazon price (rough)", "Use my target selling price"],
-        index=0,
+with st.expander("✅ What the 'Install' button is"):
+    st.write(
+        "That **Install** button is from your browser (Chrome/Edge). It lets you install this page as a desktop-style app "
+        "(a shortcut / PWA). **Completely optional**. You can ignore it safely."
     )
-    target_sell = st.number_input("Target selling price ($)", min_value=1.0, value=24.99, step=0.50)
-    fee_pct = st.slider("Marketplace fee % (eBay/Amazon etc.)", min_value=5.0, max_value=25.0, value=15.0, step=0.5)
-    fee_fixed = st.number_input("Fixed fee per order ($)", min_value=0.0, value=0.30, step=0.05)
 
-    ship_cost = st.number_input("Shipping cost ($)", min_value=0.0, value=4.50, step=0.25)
-    pack_cost = st.number_input("Packaging cost ($)", min_value=0.0, value=0.50, step=0.10)
-    misc_cost = st.number_input("Misc cost ($) (labels/returns buffer)", min_value=0.0, value=0.75, step=0.25)
+# Sidebar controls
+st.sidebar.header("A) Source")
+amazon_domain = st.sidebar.selectbox("Amazon domain", ["amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de"], index=0)
+category_id = st.sidebar.text_input("Rainforest category_id", value="electronics")
+scan_n = st.sidebar.slider("How many bestsellers to scan", min_value=5, max_value=50, value=15, step=1)
 
-    st.divider()
-    st.header("C) Buy-cost model (COGS estimate)")
-    buy_cost_mode = st.selectbox(
-        "How to estimate buy cost",
-        ["Use Amazon price as buy cost (worst case)", "Use % of Amazon price", "Manual buy cost (same for all)"],
-        index=1,
-    )
-    buy_pct = st.slider("Buy cost % of Amazon price", min_value=10, max_value=95, value=60, step=1)
-    manual_buy = st.number_input("Manual buy cost ($)", min_value=0.10, value=8.00, step=0.25)
+st.sidebar.header("B) Your selling assumptions")
+marketplace = st.sidebar.selectbox("Marketplace you plan to sell on (for fee math)", ["Amazon", "eBay", "Etsy"], index=0)
 
-    st.divider()
-    st.header("D) AI (optional)")
-    use_ai = st.toggle("Use AI review-gap analysis (costs OpenAI tokens)", value=False)
-    ai_top_k = st.slider("AI analyze top K results", min_value=1, max_value=8, value=3, step=1)
-    reviews_limit = st.slider("Critical reviews to fetch per ASIN", min_value=10, max_value=80, value=35, step=5)
+sell_price_mode = st.sidebar.selectbox(
+    "Selling price for profit math",
+    ["Use Amazon price (rough)", "Use my target selling price"],
+    index=0,
+)
 
-    st.divider()
-    st.caption("Keys are read from Streamlit Secrets: RAINFOREST_API_KEY, OPENAI_API_KEY (optional), OPENAI_MODEL (optional).")
+target_price = st.sidebar.number_input("Target selling price ($)", min_value=1.0, value=24.99, step=0.50)
+
+fee_pct_default = 15.0 if marketplace == "Amazon" else (13.0 if marketplace == "eBay" else 10.0)
+fee_pct = st.sidebar.slider(f"Marketplace fee % ({marketplace})", min_value=0, max_value=30, value=int(fee_pct_default))
+fixed_fee = st.sidebar.number_input("Fixed fee per order ($)", min_value=0.0, value=0.30, step=0.10)
+shipping_cost = st.sidebar.number_input("Shipping cost ($)", min_value=0.0, value=4.50, step=0.50)
+packaging_cost = st.sidebar.number_input("Packaging cost ($)", min_value=0.0, value=0.50, step=0.10)
+
+st.sidebar.header("C) Sourcing assumptions")
+expected_discount = st.sidebar.slider(
+    "Expected sourcing discount vs selling price (%)",
+    min_value=5,
+    max_value=80,
+    value=35,
+    help="Rough guess: if you can source at 35% below your selling price, what does profit look like?",
+)
+
+desired_profit = st.sidebar.number_input(
+    "Desired profit per unit ($) (used to compute Max Buy Price)",
+    min_value=0.0,
+    value=3.00,
+    step=0.50,
+)
+
+st.sidebar.header("D) Optional AI")
+use_ai = st.sidebar.checkbox("Enable AI review-gap insights (costs OpenAI + Rainforest review credits)", value=False)
+ai_top_n = st.sidebar.slider("Fetch critical reviews for top N products", min_value=0, max_value=10, value=3, step=1)
+
+# Key status
+st.sidebar.markdown("---")
+st.sidebar.subheader("Keys status")
+st.sidebar.write(("✅" if RAINFOREST_API_KEY else "❌") + " RAINFOREST_API_KEY")
+st.sidebar.write(("✅" if OPENAI_API_KEY else "⚠️") + " OPENAI_API_KEY (optional)")
+if OPENAI_MODEL:
+    st.sidebar.write(f"Model: `{OPENAI_MODEL}`")
 
 
-col_left, col_right = st.columns([1.1, 1.0], gap="large")
-
-with col_left:
-    st.subheader("Run")
-    run_scan = st.button("🚀 Run scan", type="primary")
-
-with col_right:
-    with st.expander("✅ What the 'Install' button is", expanded=False):
-        st.write(
-            "That **Install** button is just your browser offering to install this Streamlit page as an app shortcut (PWA). "
-            "It’s optional. You can ignore it safely."
-        )
-
-
-# =========================
-# Run Scan Logic (ONLY executes when button clicked)
-# =========================
+# -----------------------------
+# Run scan (IMPORTANT: rows only exists inside this block)
+# -----------------------------
+run_scan = st.button("🚀 Run scan")
 
 if run_scan:
-    if not RAINFOREST_API_KEY:
-        st.error("Missing RAINFOREST_API_KEY. Go to Streamlit → Manage app → Settings → Secrets and add it.")
-        st.stop()
+    with st.spinner("Pulling Amazon bestsellers from Rainforest..."):
+        try:
+            data = rf_get(
+                {
+                    "type": "bestsellers",
+                    "amazon_domain": amazon_domain,
+                    "category_id": category_id,
+                }
+            )
+        except Exception as e:
+            st.error(f"Rainforest error: {e}")
+            st.stop()
 
-    st.info("Pulling Amazon bestsellers from Rainforest…")
+    bestsellers = data.get("bestsellers", []) or data.get("best_sellers", []) or []
 
-    try:
-        data = rf_bestsellers(amazon_domain, category_id.strip(), RAINFOREST_API_KEY)
-    except requests.HTTPError as e:
-        # Better message for common 401/403
-        msg = str(e)
-        if "401" in msg or "Unauthorized" in msg:
-            st.error("Rainforest returned 401 Unauthorized. This usually means your RAINFOREST_API_KEY is wrong or not active.")
-        else:
-            st.error(f"Rainforest HTTP error: {e}")
+    if not bestsellers:
+        st.warning("No bestsellers returned. Try another category_id (example: 'electronics', 'home_and_kitchen').")
         st.stop()
-    except Exception as e:
-        st.error(f"Rainforest request failed: {e}")
-        st.stop()
-
-    items = parse_bestsellers(data)
-    if not items:
-        st.warning("No bestsellers returned. Try another category_id.")
-        st.session_state["last_df"] = None
-        st.stop()
-
-    items = items[: int(scan_n)]
 
     rows: List[Dict[str, Any]] = []
 
-    for it in items:
-        asin = it.get("asin") or it.get("ASIN")
-        title = it.get("title") or it.get("name") or ""
-        rank = it.get("rank")
-        try:
-            rank_int = int(rank) if rank is not None else None
-        except Exception:
-            rank_int = None
+    # Process items
+    for item in bestsellers[:scan_n]:
+        title = item.get("title") or item.get("name") or ""
+        asin = item.get("asin") or ""
+        rank = item.get("rank") or item.get("position") or None
+        link = item.get("link") or item.get("url") or ""
+        brand = item.get("brand") or item.get("brand_name") or ""
 
-        amazon_price = extract_price(it)
-        rating, reviews = extract_rating_reviews(it)
-
-        # Selling price assumption
-        if sell_price_mode == "Use Amazon price (rough)":
-            sell_price = float(amazon_price) if amazon_price else float(target_sell)
-        else:
-            sell_price = float(target_sell)
-
-        # Buy-cost assumption
-        if buy_cost_mode == "Use Amazon price as buy cost (worst case)":
-            buy_cost = float(amazon_price) if amazon_price else float(manual_buy)
-        elif buy_cost_mode == "Use % of Amazon price":
-            base = float(amazon_price) if amazon_price else float(manual_buy)
-            buy_cost = base * (float(buy_pct) / 100.0)
-        else:
-            buy_cost = float(manual_buy)
-
-        profit, margin = profit_math(
-            sell_price=sell_price,
-            buy_cost=buy_cost,
-            fee_pct=float(fee_pct),
-            fee_fixed=float(fee_fixed),
-            ship_cost=float(ship_cost),
-            pack_cost=float(pack_cost),
-            misc_cost=float(misc_cost),
+        # Price extraction (best effort)
+        amazon_price = (
+            parse_price_value(item.get("price"))
+            or parse_price_value(safe_get(item, ["prices", "price"]))
+            or parse_price_value(safe_get(item, ["prices", 0, "price"]))  # sometimes list
+            or parse_price_value(item.get("price_raw"))
         )
 
-        d_score = demand_score(rank_int, rating, reviews)
-        c_score = competition_score(reviews, rating)
-        p_score = profit_score(profit, margin)
-        o_score = overall_score(d_score, p_score, c_score)
+        # Reviews/rating extraction (best effort)
+        rating = (
+            safe_get(item, ["rating"])
+            or safe_get(item, ["reviews", "rating"])
+            or safe_get(item, ["customer_reviews", "rating"])
+        )
+        reviews_count = (
+            safe_get(item, ["reviews_total"])
+            or safe_get(item, ["reviews", "total"])
+            or safe_get(item, ["customer_reviews", "total_reviews"])
+            or 0
+        )
+        try:
+            reviews_count = int(str(reviews_count).replace(",", "").strip())
+        except Exception:
+            reviews_count = 0
 
-        flags = []
-        if profit < 3:
-            flags.append("Low $ profit")
-        if margin < 15:
-            flags.append("Low margin")
-        if rating is not None and rating < 4.1:
-            flags.append("Rating risk")
-        if reviews is not None and reviews > 8000:
-            flags.append("Strong incumbents")
-        if title and any(w in title.lower() for w in ["vitamin", "supplement", "blood", "test", "medical"]):
-            flags.append("Regulated/gated risk")
+        # Selling price used for profit math
+        if sell_price_mode == "Use Amazon price (rough)" and amazon_price:
+            sell_price = float(amazon_price)
+        else:
+            sell_price = float(target_price)
+
+        # Cost guess based on expected discount
+        est_buy_price = sell_price * (1 - expected_discount / 100.0)
+
+        # Fee math
+        est_fee = sell_price * (fee_pct / 100.0) + float(fixed_fee)
+        est_profit = sell_price - est_fee - float(shipping_cost) - float(packaging_cost) - est_buy_price
+        est_margin_pct = (est_profit / sell_price * 100.0) if sell_price > 0 else 0.0
+
+        # Max buy price to still hit desired profit
+        max_buy_price = sell_price - est_fee - float(shipping_cost) - float(packaging_cost) - float(desired_profit)
+
+        # Scoring
+        # demand_score: higher when rank is closer to 1
+        try:
+            r = int(rank) if rank is not None else None
+        except Exception:
+            r = None
+        if r is None:
+            demand_score = 50.0
+        else:
+            # map 1..scan_n into 100..0-ish
+            demand_score = max(0.0, 100.0 * (1.0 - (r - 1) / max(1, (scan_n - 1))))
+
+        # competition_score: higher when review count is high
+        comp_raw = math.log10(reviews_count + 1)
+        competition_score = min(100.0, comp_raw / 5.0 * 100.0)  # rough normalization
+
+        # margin_score: cap at 0..100
+        margin_score = max(0.0, min(100.0, (est_margin_pct + 20.0) * 2.0))  # shifts negative margins down
+
+        # risk penalty (very simple)
+        risk_flags = []
+        risk_penalty = 0.0
+        if brand and brand.lower() not in ["generic", "unbranded"]:
+            risk_flags.append("Brand/gating risk")
+            risk_penalty += 8.0
+        if sell_price < 10:
+            risk_flags.append("Low price (fees hurt margin)")
+            risk_penalty += 5.0
+
+        # overall score
+        overall_score = (
+            0.45 * demand_score
+            + 0.35 * margin_score
+            + 0.20 * (100.0 - competition_score)
+            - risk_penalty
+        )
 
         rows.append(
             {
-                "overall_score": round(o_score, 2),
-                "demand_score": round(d_score, 2),
-                "profit_score": round(p_score, 2),
-                "competition_score": round(c_score, 2),
+                "overall_score": round(overall_score, 2),
                 "title": title,
                 "asin": asin,
-                "rank": rank_int,
-                "amazon_price": round(amazon_price, 2) if amazon_price else None,
-                "assumed_sell_price": round(sell_price, 2),
-                "assumed_buy_cost": round(buy_cost, 2),
-                "est_profit_$": round(profit, 2),
-                "est_margin_%": round(margin, 2),
+                "rank": rank,
+                "brand": brand,
+                "amazon_price": round(float(amazon_price), 2) if amazon_price else None,
+                "sell_price_used": round(sell_price, 2),
+                "expected_buy_price": round(est_buy_price, 2),
+                "max_buy_price_for_target_profit": round(max_buy_price, 2),
+                "est_profit": round(est_profit, 2),
+                "est_margin_%": round(est_margin_pct, 2),
                 "rating": rating,
-                "reviews": reviews,
-                "risk_flags": "; ".join(flags),
+                "reviews_count": reviews_count,
+                "competition_score": round(competition_score, 2),
+                "demand_score": round(demand_score, 2),
+                "risk_flags": ", ".join(risk_flags) if risk_flags else "",
+                "link": link,
             }
         )
 
-    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    df = pd.DataFrame(rows)
 
     if df.empty:
-        st.warning("No products returned. Try another category_id or reduce scan size, then click Run scan again.")
-        st.session_state["last_df"] = None
+        st.warning("No products processed. Try another category_id or reduce scan size.")
         st.stop()
 
-    # Sort safely
-    if "overall_score" in df.columns:
-        df = df.sort_values("overall_score", ascending=False)
-    else:
-        # fallback
-        for c in ["profit_score", "demand_score"]:
-            if c in df.columns:
-                df = df.sort_values(c, ascending=False)
-                break
-
+    df = df.sort_values("overall_score", ascending=False).reset_index(drop=True)
     st.session_state["last_df"] = df
-    st.success("Scan complete. Results are below 👇")
+
+    st.success(f"Done. Scanned {len(df)} products from category_id='{category_id}' on {amazon_domain}.")
 
 
-# =========================
-# DISPLAY (always safe)
-# =========================
-
-df_show = st.session_state.get("last_df", None)
-
+# -----------------------------
+# Display section (SAFE: uses session_state only)
+# -----------------------------
 st.subheader("✅ Shortlist")
-if df_show is None or not isinstance(df_show, pd.DataFrame) or df_show.empty:
-    st.info("Click **Run scan** to generate results.")
+st.write("This is your **ranked list**. Use it to pick the top candidates worth sourcing + testing first.")
+
+df_last = st.session_state.get("last_df")
+
+if df_last is None:
+    st.info('Click **"Run scan"** to generate results.')
 else:
-    st.dataframe(df_show, use_container_width=True)
+    st.dataframe(df_last, use_container_width=True)
 
     st.download_button(
         "Download CSV shortlist",
-        df_show.to_csv(index=False).encode("utf-8"),
+        df_last.to_csv(index=False).encode("utf-8"),
         file_name="product_shortlist.csv",
         mime="text/csv",
     )
 
-    st.divider()
-    st.subheader("🔎 US Sourcing lead generator (wholesalers first)")
+    st.subheader("🔎 Sourcing lead generator (US wholesalers first)")
+    st.write("For the top products, copy/paste these into Google (or your supplier sites).")
 
-    st.write("For the top products, copy/paste these searches into Google (avoids Amazon/eBay as sources):")
-
-    top_titles = df_show["title"].head(6).fillna("").tolist()
-
+    top_titles = df_last["title"].head(5).tolist()
     for t in top_titles:
-        t = t.strip()
-        if not t:
-            continue
-
         st.markdown(f"**{t}**")
         st.code(
             "\n".join(
                 [
-                    f'wholesale "{t}" USA',
+                    f'"{t}" wholesale USA',
                     f'"{t}" distributor USA',
                     f'"{t}" bulk supplier USA',
                     f'site:faire.com "{t}"',
                     f'site:tundra.com "{t}"',
                     f'site:thomasnet.com "{t}"',
-                    f'site:wholesalecentral.com "{t}"',
-                    f'site:catalog.com "{t}"',
                 ]
             ),
             language="text",
         )
 
-    st.divider()
-    st.subheader("🧠 AI review-gap analysis (optional)")
+    if use_ai and ai_top_n > 0:
+        st.subheader("🧠 AI review-gap insights (optional)")
+        st.write("This pulls **critical reviews** for top products and summarizes gaps. This can consume Rainforest credits.")
 
-    if use_ai:
-        if not OPENAI_API_KEY:
-            st.warning("AI is ON but OPENAI_API_KEY is missing in Secrets. Add it or turn AI OFF.")
-        else:
-            # Let user choose which rows to analyze
-            max_rows = min(int(ai_top_k), len(df_show))
-            st.write(f"AI will analyze critical reviews for the top **{max_rows}** results (by overall_score).")
+        for i in range(min(ai_top_n, len(df_last))):
+            asin = str(df_last.loc[i, "asin"])
+            title = str(df_last.loc[i, "title"])
 
-            for i in range(max_rows):
-                row = df_show.iloc[i]
-                asin = row.get("asin")
-                title = row.get("title", "")
+            if not asin or asin.lower() == "nan":
+                continue
 
-                if not asin or not isinstance(asin, str):
+            with st.spinner(f"Fetching critical reviews for: {title[:60]}..."):
+                try:
+                    reviews_json = rf_get(
+                        {
+                            "type": "reviews",
+                            "amazon_domain": amazon_domain,
+                            "asin": asin,
+                            "review_stars": "all_critical",
+                            "sort_by": "most_recent",
+                        }
+                    )
+                except Exception as e:
+                    st.warning(f"Could not fetch reviews for {asin}: {e}")
                     continue
 
-                with st.expander(f"AI: {title} (ASIN: {asin})", expanded=(i == 0)):
-                    try:
-                        rev_data = rf_reviews(amazon_domain, asin, RAINFOREST_API_KEY, limit=int(reviews_limit))
-                        reviews_list = rev_data.get("reviews", []) if isinstance(rev_data, dict) else []
-                        bodies = []
-                        for r in reviews_list:
-                            if isinstance(r, dict) and r.get("body"):
-                                bodies.append(str(r["body"]))
-                        if not bodies:
-                            st.info("No critical reviews returned for this ASIN (or API plan limit).")
-                            continue
+            reviews = reviews_json.get("reviews", []) or []
+            snippets = []
+            for r in reviews[:20]:
+                body = r.get("body") or r.get("review") or ""
+                if body:
+                    snippets.append(body.strip())
 
-                        ai_text = openai_analyze(title, bodies, OPENAI_MODEL)
-                        st.markdown(ai_text)
-                    except requests.HTTPError as e:
-                        st.error(f"Rainforest reviews HTTP error: {e}")
-                    except Exception as e:
-                        st.error(f"AI analysis failed: {e}")
-    else:
-        st.info("Turn ON AI in the sidebar if you want the app to analyze critical reviews and suggest improvements/bundles.")
+            critical_text = "\n\n".join(snippets) if snippets else "No review text returned."
 
-st.divider()
-with st.expander("📌 Notes (important for real-world selling)", expanded=False):
-    st.write(
-        "- Some items are **gated / restricted** on Amazon (supplements, medical tests, certain brands). Treat those as higher risk.\n"
-        "- For eBay, brand/IP can also cause issues (YETI, Disney, etc.).\n"
-        "- This tool is a **scanner**. You still confirm suppliers, MAP policies, authenticity, and return rates before buying inventory."
-    )
+            with st.spinner("Running AI summary..."):
+                try:
+                    analysis = ai_gap_analysis(title, critical_text)
+                except Exception as e:
+                    analysis = f"AI error: {e}"
+
+            with st.expander(f"AI insights: {title}"):
+                st.write(analysis)
