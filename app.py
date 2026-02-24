@@ -226,20 +226,19 @@ else:
 
 st.session_state["last_df"] = df
 # ---- DISPLAY (safe) ----
-if st.session_state.get("last_df") is not None:
-    st.subheader("Shortlist")
-    st.dataframe(st.session_state["last_df"], use_container_width=True)
+df_display = st.session_state.get("last_df")
+
+if df_display is None or df_display.empty:
+    st.info("Click **Run scan** to generate results.")
 else:
-    st.info("Click 'Run scan' to generate results.")
-    
-        st.subheader("✅ Shortlist (sorted by overall_score)")
-    st.dataframe(df, use_container_width=True)
+    st.subheader("✅ Shortlist")
+    st.dataframe(df_display, use_container_width=True)
 
     st.download_button(
         "Download CSV shortlist",
-        df.to_csv(index=False).encode("utf-8"),
+        df_display.to_csv(index=False).encode("utf-8"),
         file_name="product_shortlist.csv",
-        mime="text/csv"
+        mime="text/csv",
     )
 
     st.subheader("🔎 Sourcing lead generator (US wholesalers first)")
