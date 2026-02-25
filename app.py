@@ -1,449 +1,1043 @@
-import os
+import math
 import re
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
 import pandas as pd
+import requests
 import streamlit as st
 
-# ============================================================
-# Product Hunter Assistant (USA Market)
-# ============================================================
 
-st.set_page_config(page_title="Product Hunter Assistant (USA Market)", layout="wide")
+# =========================
+# Page config
+# =========================
+st.set_page_config(
+    page_title="Product Hunter Assistant (USA Market)",
+    page_icon="🧭",
+    layout="wide",
+)
 
-# -------------------------
-# Secrets
-# -------------------------
+
+# =========================
+# Secrets helper
+# =========================
 def get_secret(key: str, default: str = "") -> str:
-    """Read from Streamlit Secrets first, then env vars."""
     try:
         return str(st.secrets.get(key, default)).strip()
     except Exception:
+        import os
+
         return str(os.getenv(key, default)).strip()
 
+
 RAINFOREST_API_KEY = get_secret("RAINFOREST_API_KEY")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # optional
 OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
-RF_REQUEST_URL = "https://api.rainforestapi.com/request"
-RF_CATEGORIES_URL = "https://api.rainforestapi.com/categories"
 
-# -------------------------
-# Risk filters (default ON)
-# -------------------------
+# =========================
+# Constants
+# =========================
+RAINFOREST_BASE = "https://api.rainforestapi.com"
+
+DEFAULT_AMAZON_DOMAIN = "amazon.com"
+
+
+# Risk filters (exclude by default)
+# Keep this as simple keyword gates; it’s intentionally conservative.
 RISK_KEYWORDS = [
-    # Brand / counterfeit / IP risk (not exhaustive)
-    "disney", "marvel", "pokemon", "nintendo", "sony", "microsoft", "apple", "samsung",
-    "lego", "barbie", "nerf", "hot wheels", "hasbro", "mattel",
-
-    # Supplements / ingestibles / regulated
-    "supplement", "vitamin", "omega", "probiotic", "creatine", "protein", "capsule",
-    "softgel", "tablet", "gummies", "edible", "dietary", "herbal", "homeopathic",
-
-    # Medical / test kits
-    "blood", "test kit", "glucose", "diabetes", "pregnancy", "covid", "diagnostic",
-    "medical", "thermometer", "stethoscope", "syringe", "needle",
-
-    # Hazmat-ish / chemicals
-    "aerosol", "propane", "butane", "fuel", "flammable", "corrosive", "acid", "bleach",
-    "solvent", "paint thinner", "pesticide", "insecticide", "herbicide", "fertilizer",
-    "lithium battery", "li-ion", "li ion",
-
+    # Supplements / health claims
+    "supplement",
+    "vitamin",
+    "creatine",
+    "whey",
+    "protein powder",
+    "fat burner",
+    "weight loss",
+    "keto",
+    "collagen",
+    "testosterone",
+    "male enhancement",
+    "libido",
+    "detox",
+    "cleanse",
+    "probiotic",
+    "pre workout",
+    "pre-workout",
+    "bcaa",
+    # Medical / tests / devices
+    "medical",
+    "medicine",
+    "drug",
+    "diagnostic",
+    "test kit",
+    "rapid test",
+    "covid",
+    "glucose",
+    "blood",
+    "bp monitor",
+    "blood pressure",
+    "thermometer",
+    "stethoscope",
+    "pregnancy test",
+    # Hazmat-ish / chemicals / flammables
+    "flammable",
+    "corrosive",
+    "acid",
+    "aerosol",
+    "propane",
+    "butane",
+    "fuel",
+    "solvent",
+    "bleach",
+    "pesticide",
+    "insecticide",
+    "herbicide",
+    "toxic",
     # Weapon-like
-    "knife", "dagger", "sword", "machete", "pepper spray", "stun gun", "taser", "ammo",
-    "firearm", "gun", "rifle", "pistol",
-
-    # Adult
-    "sex", "vibrator",
+    "knife",
+    "dagger",
+    "machete",
+    "sword",
+    "switchblade",
+    "tactical",
+    "ammo",
+    "gun",
+    "firearm",
+    "holster",
+    "crossbow",
+    "arrowhead",
+    "pepper spray",
+    # Brand-heavy signals (not perfect, but reduces brand/IP risk)
+    "disney",
+    "pokemon",
+    "nintendo",
+    "marvel",
+    "star wars",
+    "lego",
+    "hello kitty",
 ]
 
-def normalize_domain(domain: str) -> str:
-    return domain.strip().lower().replace("https://", "").replace("http://", "")
 
-def risk_reasons(title: str) -> List[str]:
-    t = (title or "").lower()
-    reasons = [k for k in RISK_KEYWORDS if k in t]
-    seen = set()
-    out = []
-    for r in reasons:
-        if r not in seen:
-            out.append(r)
-            seen.add(r)
-    return out
+# =========================
+# Session state init
+# =========================
+def init_state() -> None:
+    st.session_state.setdefault("requests_used", 0)
+    st.session_state.setdefault("api_cache", {})  # key -> (timestamp, json)
+    st.session_state.setdefault("category_results", [])  # last categories search
+    st.session_state.setdefault("selected_category_obj", None)
+    st.session_state.setdefault("my_shortlist", [])  # list of dict rows
 
-def parse_price(value: Any) -> Optional[float]:
-    if value is None:
+
+init_state()
+
+
+# =========================
+# Utilities
+# =========================
+def norm_text(s: str) -> str:
+    return (s or "").strip().lower()
+
+
+def extract_price_value(p: Any) -> Optional[float]:
+    """
+    Rainforest often returns:
+      price: { "value": 24.99, "currency": "USD", ... }
+    or sometimes "price": 24.99
+    """
+    if p is None:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).replace(",", "")
-    m = re.search(r"(\d+(\.\d+)?)", s)
-    return float(m.group(1)) if m else None
-
-def pick_title(item: Dict[str, Any]) -> str:
-    return str(item.get("title") or item.get("name") or "").strip()
-
-def pick_asin(item: Dict[str, Any]) -> str:
-    return str(item.get("asin") or "").strip()
-
-# -------------------------
-# Rainforest helpers (cached)
-# -------------------------
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def rf_get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def estimate_requests(scan_mode: str, n_items: int, deep_reviews_n: int) -> int:
-    base = 1  # one request for the main scan call
-    if scan_mode == "Deep dive":
-        base += min(n_items, deep_reviews_n)  # 1 request per item for reviews
-    return base
-
-def extract_categories(data: Any) -> List[Dict[str, str]]:
-    if data is None:
-        return []
-    if isinstance(data, list):
-        raw = data
-    elif isinstance(data, dict):
-        raw = data.get("categories") or data.get("results") or data.get("data") or []
-    else:
-        raw = []
-    out: List[Dict[str, str]] = []
-    for c in raw:
-        if not isinstance(c, dict):
-            continue
-        cid = str(c.get("id") or c.get("category_id") or "").strip()
-        name = str(c.get("name") or c.get("title") or c.get("path") or "").strip()
-        if cid:
-            out.append({"id": cid, "name": name or cid})
-    return out
-
-def fetch_bestsellers(api_key: str, domain: str, category_id: str) -> List[Dict[str, Any]]:
-    params = {
-        "api_key": api_key,
-        "type": "bestsellers",
-        "amazon_domain": domain,
-        "category_id": category_id,
-    }
-    data = rf_get(RF_REQUEST_URL, params)
-    return data.get("bestsellers", []) or []
-
-def fetch_critical_reviews(api_key: str, domain: str, asin: str, max_reviews: int = 25) -> List[str]:
-    params = {
-        "api_key": api_key,
-        "type": "reviews",
-        "amazon_domain": domain,
-        "asin": asin,
-        "review_stars": "all_critical",
-        "sort_by": "most_recent",
-    }
-    data = rf_get(RF_REQUEST_URL, params)
-    reviews = data.get("reviews", []) or []
-    texts: List[str] = []
-    for r in reviews[:max_reviews]:
-        body = (r.get("body") or "").strip()
-        if body:
-            texts.append(body)
-    return texts
-
-# -------------------------
-# Optional OpenAI (safe)
-# -------------------------
-def ai_gap_insights(title: str, critical_reviews: List[str]) -> str:
-    if not OPENAI_API_KEY:
-        return "OPENAI_API_KEY missing. Add it in Streamlit Secrets to enable AI insights."
-    if not critical_reviews:
-        return "No critical reviews found to analyze."
-    try:
-        from openai import OpenAI  # type: ignore
-    except Exception:
-        return "OpenAI package not installed. Add `openai` to requirements.txt and redeploy."
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    text = "\n\n".join(critical_reviews[:20])
-    prompt = (
-        f"Analyze these critical reviews for an Amazon product.\n\n"
-        f"TITLE: {title}\n\n"
-        f"CRITICAL REVIEWS:\n{text}\n\n"
-        "Output:\n"
-        "1) Top 3 specific complaints (bullets)\n"
-        "2) One improved product blueprint (5-7 bullets)\n"
-        "3) 2 bundle ideas (bullets)\n"
-        "4) 2 listing angles (bullets)\n"
-        "Keep it practical for resale/wholesale. Avoid illegal/medical claims."
-    )
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    return resp.choices[0].message.content.strip()
-
-# -------------------------
-# App wrapper (prevents blank pages)
-# -------------------------
-def main() -> None:
-    st.title("🧭 Product Hunter Assistant (USA Market)")
-    st.caption(
-        "This app pulls Amazon Category Best Sellers (best-selling products in that category). "
-        "Use Category Finder to get the correct bestsellers category_id. "
-        "Risky items are excluded by default."
-    )
-
-    if not RAINFOREST_API_KEY:
-        st.error("RAINFOREST_API_KEY is missing. Add it in Streamlit Secrets, then reboot.")
-        st.stop()
-
-    # session_state init (prevents your category picker bug)
-    if "cat_search_results" not in st.session_state:
-        st.session_state.cat_search_results = []
-    if "category_id_input" not in st.session_state:
-        st.session_state.category_id_input = ""
-
-    with st.sidebar:
-        st.header("A) Platform")
-        domain = normalize_domain(
-            st.selectbox("Amazon domain", ["amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de"], index=0)
-        )
-
-        st.header("B) Category Finder (recommended)")
-        st.caption("Find the correct BESTSELLERS category_id (costs ~1 request per search).")
-        search_term = st.text_input(
-            "Search term for categories",
-            value="",
-            placeholder="e.g., Home & Kitchen / Pet / Tools",
-        )
-
-        col1, col2 = st.columns(2)
-        do_cat_search = col1.button("Search categories")
-        force_refresh = col2.checkbox("Force refresh", value=False, help="Bypass cache (may use extra requests).")
-
-        if force_refresh:
-            st.cache_data.clear()
-
-        if do_cat_search:
-            if not search_term.strip():
-                st.warning("Type a category search term first (e.g., Home & Kitchen).")
-            else:
-                try:
-                    params = {
-                        "api_key": RAINFOREST_API_KEY,
-                        "domain": domain,
-                        "type": "bestsellers",
-                        "search_term": search_term.strip(),
-                    }
-                    data = rf_get(RF_CATEGORIES_URL, params)
-                    cats = extract_categories(data)
-                    st.session_state.cat_search_results = cats
-                    if not cats:
-                        st.warning("No categories returned. Try: Kitchen / Pet / Tools / Storage.")
-                except Exception as e:
-                    st.error(f"Category search failed: {e}")
-
-        def on_pick_category() -> None:
-            sel = st.session_state.get("pick_cat_selectbox", "")
-            if sel and "|" in sel:
-                st.session_state.category_id_input = sel.split("|")[-1].strip()
-
-        if st.session_state.cat_search_results:
-            options = [f"{c['name']}  |  {c['id']}" for c in st.session_state.cat_search_results]
-            st.selectbox(
-                "Pick a category_id",
-                options=options,
-                index=0,
-                key="pick_cat_selectbox",
-                on_change=on_pick_category,
-            )
-
-        st.text_input(
-            "Category id (BESTSELLERS)",
-            key="category_id_input",
-            help="Paste category_id from Category Finder (often like bestsellers_###########).",
-        )
-
-        st.header("C) Scan size + request planning")
-        n_items = st.slider("How many items to scan", min_value=5, max_value=50, value=15, step=5)
-
-        scan_mode = st.radio(
-            "Scan mode",
-            ["Fast scan", "Deep dive"],
-            index=0,
-            help="Deep dive fetches critical reviews for top items (extra requests).",
-        )
-        deep_reviews_n = st.slider("Deep dive: reviews for top N items", 1, 15, 5, 1, disabled=(scan_mode != "Deep dive"))
-        enable_ai = st.checkbox("AI review-gap insights (OpenAI)", value=False, disabled=(scan_mode != "Deep dive"))
-
-        exclude_risk = st.checkbox(
-            "Exclude risk-flagged items (brand-heavy / supplements / medical-test / hazmat-ish / weapon-like)",
-            value=True,
-        )
-
-        st.header("D) Target selling price range (optional)")
-        price_range = st.slider("Price range filter", 0, 200, (0, 200), step=5)
-
-        st.header("E) Profitability assumptions (NOT scan filters)")
-        fee_pct = st.slider("Marketplace fee % (rough)", 5, 25, 15, 1)
-        fixed_fee = st.number_input("Fixed fee per order ($)", 0.0, 10.0, 0.30, 0.05)
-        ship_cost = st.number_input("Shipping cost ($)", 0.0, 50.0, 4.50, 0.50)
-        pack_cost = st.number_input("Packaging cost ($)", 0.0, 10.0, 0.50, 0.10)
-        desired_profit = st.number_input("Desired profit per unit ($)", 0.0, 100.0, 8.0, 0.50)
-
-        est = estimate_requests("Deep dive" if scan_mode == "Deep dive" else "Fast scan", n_items, deep_reviews_n)
-        st.info(f"Estimated Rainforest requests for next Run scan: **{est}** (Category Finder searches not included).")
-
-        st.header("Keys status")
-        st.write(("✅" if bool(RAINFOREST_API_KEY) else "❌") + " RAINFOREST_API_KEY")
-        st.write(("✅" if bool(OPENAI_API_KEY) else "⚪") + " OPENAI_API_KEY (optional)")
-        st.caption(f"Model: {OPENAI_MODEL}")
-
-    run = st.button("🚀 Run scan", type="primary")
-
-    def compute_profit_cols(sell_price: Optional[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        if sell_price is None:
-            return None, None, None
-        fee_amt = sell_price * (fee_pct / 100.0)
-        total_cost = fee_amt + fixed_fee + ship_cost + pack_cost + desired_profit
-        max_buy = max(0.0, sell_price - total_cost)
-        return round(fee_amt, 2), round(max_buy, 2), round(total_cost, 2)
-
-    if not run:
-        st.subheader("✅ Shortlist candidates (from bestsellers)")
-        st.info("Click **Run scan** to generate results.")
-        return
-
-    category_id = st.session_state.get("category_id_input", "").strip()
-    if not category_id:
-        st.warning("Pick a category_id using Category Finder, then click Run scan.")
-        st.stop()
-
-    with st.spinner("Pulling category best sellers..."):
+    if isinstance(p, (int, float)):
+        return float(p)
+    if isinstance(p, dict):
+        v = p.get("value")
         try:
-            items = fetch_bestsellers(RAINFOREST_API_KEY, domain, category_id)
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+    return None
+
+
+def amazon_dp_url(amazon_domain: str, asin: str) -> str:
+    return f"https://www.{amazon_domain}/dp/{asin}"
+
+
+def safe_get(d: Dict[str, Any], path: List[str], default=None):
+    cur: Any = d
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def flag_risk(title: str, brand: str = "") -> List[str]:
+    t = norm_text(title)
+    b = norm_text(brand)
+    hits = []
+    for kw in RISK_KEYWORDS:
+        kw_n = norm_text(kw)
+        if kw_n and (kw_n in t or kw_n in b):
+            hits.append(kw)
+    return hits
+
+
+def cache_key(url: str, params: Dict[str, Any]) -> str:
+    # stable cache key: url + sorted params
+    parts = [url] + [f"{k}={params[k]}" for k in sorted(params.keys())]
+    return "||".join(parts)
+
+
+def rainforest_get_json(
+    endpoint: str,
+    params: Dict[str, Any],
+    force_refresh: bool,
+    count_request: bool = True,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """
+    Small in-session cache to avoid wasting trial requests.
+    If force_refresh is False and cached result exists, returns cached (no request count).
+    """
+    url = f"{RAINFOREST_BASE}{endpoint}"
+    params2 = dict(params)
+
+    if "api_key" not in params2:
+        params2["api_key"] = RAINFOREST_API_KEY
+
+    key = cache_key(url, params2)
+    if not force_refresh and key in st.session_state["api_cache"]:
+        _, cached = st.session_state["api_cache"][key]
+        return cached
+
+    r = requests.get(url, params=params2, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+
+    st.session_state["api_cache"][key] = (time.time(), data)
+    if count_request:
+        st.session_state["requests_used"] += 1
+    return data
+
+
+def estimate_requests_scan(
+    scan_mode: str,
+    list_pages: int,
+    deep_dive_n: int,
+    include_summarization: bool,
+) -> int:
+    # Bestsellers/search pages are 1 request each
+    est = max(1, list_pages)
+
+    if scan_mode == "Deep dive":
+        # product request is ~1 each; if include_summarization_attributes is enabled,
+        # Rainforest docs indicate it costs extra credits (commonly 2 total for that request).
+        # We conservatively estimate 2 per product when enabled.
+        per_product = 2 if include_summarization else 1
+        est += deep_dive_n * per_product
+
+    return est
+
+
+# =========================
+# Rainforest adapters
+# =========================
+def categories_search_bestsellers(
+    amazon_domain: str,
+    search_term: str,
+    force_refresh: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Categories API (bestsellers).
+    Endpoint commonly: /categories
+    Params per TrajectData docs: type=bestsellers, amazon_domain, search_term
+    """
+    if not search_term.strip():
+        return []
+
+    data = rainforest_get_json(
+        endpoint="/categories",
+        params={
+            "type": "bestsellers",
+            "amazon_domain": amazon_domain,
+            "search_term": search_term.strip(),
+        },
+        force_refresh=force_refresh,
+        count_request=True,
+    )
+
+    cats = data.get("categories") or []
+    # ensure dicts
+    return [c for c in cats if isinstance(c, dict)]
+
+
+def build_list_url_from_category(cat_obj: Optional[Dict[str, Any]], amazon_domain: str) -> Optional[str]:
+    """
+    Prefer the url from categories response if present.
+    Otherwise, try to build from category_id like "bestsellers_17871150011".
+    """
+    if cat_obj and isinstance(cat_obj, dict):
+        u = cat_obj.get("url")
+        if isinstance(u, str) and u.startswith("http"):
+            return u
+
+        cid = cat_obj.get("id") or cat_obj.get("category_id")
+        if isinstance(cid, str) and "bestsellers_" in cid:
+            node = cid.split("bestsellers_", 1)[1]
+            node = re.sub(r"[^\d]", "", node)  # digits only
+            if node:
+                return f"https://www.{amazon_domain}/Best-Sellers/zgbs/?node={node}"
+
+    return None
+
+
+def list_url_for_list_type(base_url: Optional[str], amazon_domain: str, list_type: str, fallback_node: Optional[str]) -> Optional[str]:
+    """
+    Converts Best Sellers category URL into other bestseller-type pages using node parameter.
+    This is more robust than trying to rewrite paths.
+
+    list_type options:
+      - Best Sellers
+      - Trending (Movers & Shakers)
+      - New Releases
+      - Most Wished For
+      - Most Gifted
+    """
+    list_type = list_type.strip()
+
+    node = fallback_node
+    if not node and base_url:
+        # try to extract node=12345 from url
+        m = re.search(r"node=(\d+)", base_url)
+        if m:
+            node = m.group(1)
+
+    # If we have a base_url, Best Sellers can just use it.
+    if list_type == "Best Sellers":
+        return base_url
+
+    # Other lists: prefer node-based URLs (works even if base_url is weird)
+    if not node:
+        return None
+
+    if list_type == "Trending (Movers & Shakers)":
+        return f"https://www.{amazon_domain}/gp/movers-and-shakers/?node={node}"
+    if list_type == "New Releases":
+        return f"https://www.{amazon_domain}/gp/new-releases/?node={node}"
+    if list_type == "Most Wished For":
+        return f"https://www.{amazon_domain}/gp/most-wished-for/?node={node}"
+    if list_type == "Most Gifted":
+        return f"https://www.{amazon_domain}/gp/most-gifted/?node={node}"
+
+    return base_url
+
+
+def fetch_bestsellers(
+    amazon_domain: str,
+    url: str,
+    page: int,
+    force_refresh: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Product Data API: type=bestsellers with url & page
+    Endpoint: /request
+    """
+    data = rainforest_get_json(
+        endpoint="/request",
+        params={
+            "type": "bestsellers",
+            "amazon_domain": amazon_domain,
+            "url": url,
+            "page": page,
+        },
+        force_refresh=force_refresh,
+        count_request=True,
+    )
+    items = data.get("bestsellers") or []
+    return [x for x in items if isinstance(x, dict)]
+
+
+def fetch_search(
+    amazon_domain: str,
+    search_term: str,
+    page: int,
+    force_refresh: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Product Data API: type=search with search_term & page
+    Endpoint: /request
+    """
+    data = rainforest_get_json(
+        endpoint="/request",
+        params={
+            "type": "search",
+            "amazon_domain": amazon_domain,
+            "search_term": search_term.strip(),
+            "page": page,
+        },
+        force_refresh=force_refresh,
+        count_request=True,
+    )
+    items = data.get("search_results") or []
+    return [x for x in items if isinstance(x, dict)]
+
+
+def fetch_product(
+    amazon_domain: str,
+    asin: str,
+    include_summarization_attributes: bool,
+    force_refresh: bool,
+) -> Dict[str, Any]:
+    """
+    Product Data API: type=product with asin
+    """
+    params = {
+        "type": "product",
+        "amazon_domain": amazon_domain,
+        "asin": asin,
+    }
+    if include_summarization_attributes:
+        params["include_summarization_attributes"] = "true"
+
+    data = rainforest_get_json(
+        endpoint="/request",
+        params=params,
+        force_refresh=force_refresh,
+        count_request=True,
+    )
+    return data if isinstance(data, dict) else {}
+
+
+# =========================
+# Scoring / ranking
+# =========================
+@dataclass
+class ProfitConfig:
+    fee_pct: float
+    fixed_fee: float
+    shipping: float
+    packaging: float
+    sourcing_discount_pct: float
+    profit_goal: float
+    hide_below_goal: bool
+    target_price_min: Optional[float]
+    target_price_max: Optional[float]
+
+
+def estimate_profitability(sell_price: Optional[float], cfg: ProfitConfig) -> Dict[str, Optional[float]]:
+    if sell_price is None or sell_price <= 0:
+        return {
+            "sell_price_used": None,
+            "buy_price_est": None,
+            "fees_est": None,
+            "profit_est": None,
+            "roi_est": None,
+            "max_buy_price": None,
+        }
+
+    # Optionally clamp sell price into a user range (ranking only)
+    if cfg.target_price_min is not None:
+        sell_price = max(sell_price, cfg.target_price_min)
+    if cfg.target_price_max is not None:
+        sell_price = min(sell_price, cfg.target_price_max)
+
+    fees = (cfg.fee_pct / 100.0) * sell_price + cfg.fixed_fee
+    buy_price_est = sell_price * (1.0 - cfg.sourcing_discount_pct / 100.0)
+    profit = sell_price - fees - cfg.shipping - cfg.packaging - buy_price_est
+    roi = None
+    if buy_price_est and buy_price_est > 0:
+        roi = profit / buy_price_est
+
+    max_buy = sell_price - fees - cfg.shipping - cfg.packaging - cfg.profit_goal
+
+    return {
+        "sell_price_used": round(sell_price, 2),
+        "buy_price_est": round(buy_price_est, 2),
+        "fees_est": round(fees, 2),
+        "profit_est": round(profit, 2),
+        "roi_est": round(roi, 3) if roi is not None else None,
+        "max_buy_price": round(max_buy, 2),
+    }
+
+
+def overall_score(row: Dict[str, Any]) -> float:
+    """
+    Simple, practical score:
+      - Profit (bigger is better)
+      - Demand (ratings_total + rating)
+      - Risk penalty if any
+    """
+    profit = row.get("profit_est")
+    rating = row.get("rating") or 0
+    ratings_total = row.get("ratings_total") or 0
+    risk_count = len(row.get("risk_flags") or [])
+
+    # profit component
+    p = 0.0
+    try:
+        p = float(profit) if profit is not None else 0.0
+    except Exception:
+        p = 0.0
+
+    # demand component (log)
+    d = 0.0
+    try:
+        d = math.log10(max(1, int(ratings_total))) + (float(rating) / 5.0)
+    except Exception:
+        d = 0.0
+
+    # risk penalty
+    penalty = 0.0
+    if risk_count > 0:
+        penalty = 2.0 + 0.5 * risk_count
+
+    return round((0.60 * p) + (0.40 * d) - penalty, 3)
+
+
+# =========================
+# Sidebar UI
+# =========================
+st.sidebar.title("🧭 Controls")
+
+st.sidebar.markdown("### A) Platform")
+amazon_domain = st.sidebar.selectbox(
+    "Amazon domain",
+    options=["amazon.com", "amazon.co.uk", "amazon.ca", "amazon.de", "amazon.fr", "amazon.it", "amazon.es"],
+    index=0,
+)
+
+force_refresh = st.sidebar.checkbox("Force refresh (bypass cache)", value=False)
+
+st.sidebar.markdown("### B) Scan Type")
+scan_source = st.sidebar.selectbox(
+    "Scan source",
+    options=[
+        "Category lists (recommended)",
+        "Keyword search (optional)",
+    ],
+    index=0,
+)
+
+list_type = st.sidebar.selectbox(
+    "List type",
+    options=[
+        "Best Sellers",
+        "Trending (Movers & Shakers)",
+        "New Releases",
+        "Most Wished For",
+        "Most Gifted",
+    ],
+    index=0,
+    help="These are all Amazon’s top-selling style lists. Trending ≈ Movers & Shakers.",
+)
+
+st.sidebar.markdown("### C) Category Finder (recommended)")
+cat_search_term = st.sidebar.text_input(
+    "Search term for categories",
+    value=st.session_state.get("cat_search_term", "Home & Kitchen"),
+    placeholder="Example: Home & Kitchen / Pet Supplies / Tools / Sports / Leather",
+)
+st.session_state["cat_search_term"] = cat_search_term
+
+col_c1, col_c2 = st.sidebar.columns([1, 1])
+with col_c1:
+    do_cat_search = st.button("Search categories")
+with col_c2:
+    # keep the checkbox here for clarity; used above in API cache bypass as well
+    st.caption("Costs ~1 request when you search")
+
+category_options: List[Dict[str, Any]] = st.session_state.get("category_results", [])
+
+cat_error_box = st.sidebar.empty()
+
+if do_cat_search:
+    if not RAINFOREST_API_KEY:
+        cat_error_box.error("Missing RAINFOREST_API_KEY in Streamlit Secrets.")
+    else:
+        try:
+            cats = categories_search_bestsellers(amazon_domain, cat_search_term, force_refresh=force_refresh)
+            if not cats:
+                st.session_state["category_results"] = []
+                cat_error_box.warning("No categories found. Try a different search term.")
+            else:
+                st.session_state["category_results"] = cats
+                category_options = cats
+                cat_error_box.success(f"Found {len(cats)} category matches.")
         except Exception as e:
-            st.error(f"Rainforest bestsellers request failed: {e}")
-            st.stop()
+            st.session_state["category_results"] = []
+            cat_error_box.error(f"Category search failed: {e}")
 
-    if not items:
-        st.warning("No bestsellers returned. Usually the category_id is wrong. Use Category Finder to pick a BESTSELLERS category_id.")
-        st.stop()
+# Build selectbox options safely (show full id so duplicates don’t look identical)
+def cat_label(c: Dict[str, Any]) -> str:
+    name = c.get("name") or c.get("title") or "Unknown"
+    cid = c.get("id") or c.get("category_id") or "no_id"
+    return f"{name} | {cid}"
 
+selected_cat = None
+if category_options:
+    labels = [cat_label(c) for c in category_options]
+    picked = st.sidebar.selectbox(
+        "Pick a category",
+        options=list(range(len(labels))),
+        format_func=lambda i: labels[i],
+        index=0,
+        key="picked_category_index",
+    )
+    selected_cat = category_options[int(picked)]
+    st.session_state["selected_category_obj"] = selected_cat
+
+    # show copyable category id + URL
+    selected_id = selected_cat.get("id") or selected_cat.get("category_id") or ""
+    selected_url = selected_cat.get("url") or ""
+
+    st.sidebar.markdown("**Selected category id (copyable)**")
+    st.sidebar.code(str(selected_id) if selected_id else "—")
+
+    if selected_url:
+        st.sidebar.markdown("**Selected list URL (copyable)**")
+        st.sidebar.code(str(selected_url))
+
+else:
+    st.sidebar.info("Use **Search categories** to find the correct bestsellers category list for your niche.")
+
+st.sidebar.markdown("### D) Product keyword (optional)")
+product_keyword = st.sidebar.text_input(
+    "Keyword (only used for Keyword search scan)",
+    value="",
+    placeholder="Example: kitchen organizer / microfiber cloth / dog toy",
+)
+
+st.sidebar.markdown("### E) Scan size + request planning")
+scan_items = st.sidebar.slider("How many items to scan", min_value=10, max_value=100, value=30, step=10)
+
+scan_mode = st.sidebar.radio(
+    "Scan mode",
+    options=["Fast scan", "Deep dive"],
+    index=0,
+    help="Fast scan uses list pages only. Deep dive fetches extra product details for your shortlist candidates.",
+)
+
+deep_dive_n = 0
+include_summarization = False
+if scan_mode == "Deep dive":
+    deep_dive_n = st.sidebar.slider("Deep dive on top N candidates", min_value=3, max_value=15, value=6, step=1)
+    include_summarization = st.sidebar.checkbox(
+        "Include Amazon 'customers say' summarization attributes (costs extra Rainforest credits)",
+        value=False,
+    )
+
+st.sidebar.markdown("### F) Target selling price range (ranking-only)")
+use_price_range = st.sidebar.checkbox("Use a target selling price range", value=False)
+target_min = target_max = None
+if use_price_range:
+    cpr1, cpr2 = st.sidebar.columns(2)
+    with cpr1:
+        target_min = st.number_input("Min ($)", min_value=0.0, value=15.0, step=1.0)
+    with cpr2:
+        target_max = st.number_input("Max ($)", min_value=0.0, value=35.0, step=1.0)
+    if target_max and target_min and target_max < target_min:
+        st.sidebar.warning("Max should be ≥ Min. (Ranking only, but still.)")
+
+st.sidebar.markdown("### G) Profitability assumptions (ranking-only)")
+fee_pct = st.sidebar.slider("Marketplace fee %", min_value=0.0, max_value=25.0, value=15.0, step=0.5)
+fixed_fee = st.sidebar.number_input("Fixed fee per order ($)", min_value=0.0, value=0.30, step=0.05)
+shipping_cost = st.sidebar.number_input("Shipping cost ($)", min_value=0.0, value=4.50, step=0.25)
+packaging_cost = st.sidebar.number_input("Packaging cost ($)", min_value=0.0, value=0.50, step=0.25)
+sourcing_discount = st.sidebar.slider(
+    "Expected sourcing discount vs selling price (%)",
+    min_value=0.0,
+    max_value=80.0,
+    value=35.0,
+    step=1.0,
+    help="This is NOT a scan filter. It just estimates buy cost for ranking.",
+)
+profit_goal = st.sidebar.number_input(
+    "Desired profit per unit ($) (goal)",
+    min_value=0.0,
+    value=8.00,
+    step=0.5,
+    help="This is NOT a scan filter. It’s used for ranking + optional hiding below goal.",
+)
+hide_below_goal = st.sidebar.checkbox("Hide items below profit goal", value=False)
+
+st.sidebar.markdown("### H) Risk filters")
+exclude_risky = st.sidebar.checkbox(
+    "Exclude risk-flagged items (brand-heavy / supplement / medical/test / hazmat / weapon-like)",
+    value=True,
+)
+
+st.sidebar.markdown("### Keys status")
+st.sidebar.write(("✅" if RAINFOREST_API_KEY else "❌") + " RAINFOREST_API_KEY")
+st.sidebar.write(("✅" if OPENAI_API_KEY else "⚪") + " OPENAI_API_KEY (optional)")
+st.sidebar.caption(f"Model (optional): {OPENAI_MODEL}")
+
+# Request estimation
+# Pages: assume ~50 items per page
+items_per_page = 50
+list_pages = max(1, math.ceil(scan_items / items_per_page))
+est_requests = estimate_requests_scan(
+    scan_mode=scan_mode,
+    list_pages=list_pages,
+    deep_dive_n=deep_dive_n,
+    include_summarization=include_summarization,
+)
+st.sidebar.info(
+    f"Estimated requests this scan may cost: **~{est_requests}**  \n"
+    f"Requests used this session: **{st.session_state['requests_used']}**"
+)
+
+
+# =========================
+# Main UI
+# =========================
+st.title("🧭 Product Hunter Assistant (USA Market)")
+st.caption(
+    "This app pulls Amazon category list pages via Rainforest, ranks opportunities (profitability is ranking-only), "
+    "excludes risky items by default, and generates sourcing leads + eBay sold-price workflows."
+)
+
+run_col1, run_col2 = st.columns([1, 3])
+with run_col1:
+    run_scan = st.button("🚀 Run scan", type="primary")
+with run_col2:
+    st.write("")
+
+tabs = st.tabs(["✅ Shortlist candidates", "⭐ My Shortlist", "🧰 Workflows & Lead Gen"])
+
+
+# =========================
+# Scan execution
+# =========================
+def normalize_items(raw_items: List[Dict[str, Any]], amazon_domain: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    filtered_out = 0
+    for it in raw_items:
+        asin = it.get("asin") or it.get("product_asin") or it.get("parent_asin")
+        title = it.get("title") or it.get("name") or ""
+        brand = it.get("brand") or ""
+        rank = it.get("rank")
+        rating = it.get("rating")
+        ratings_total = it.get("ratings_total") or it.get("ratings_total_count") or it.get("reviews_total") or 0
+        price = extract_price_value(it.get("price"))
+        if price is None:
+            price = extract_price_value(it.get("price_current"))
 
-    for idx, item in enumerate(items[:n_items], start=1):
-        title = pick_title(item)
-        asin = pick_asin(item)
-        reasons = risk_reasons(title)
-
-        if exclude_risk and reasons:
-            filtered_out += 1
-            continue
-
-        p = None
-        if isinstance(item.get("price"), dict):
-            p = parse_price(item["price"].get("value") or item["price"].get("raw"))
-        else:
-            p = parse_price(item.get("price") or item.get("price_raw") or item.get("price_value"))
-
-        fee_amt, max_buy, total_cost = compute_profit_cols(p)
+        risk_flags = flag_risk(title, brand)
 
         rows.append(
             {
-                "rank": item.get("rank", idx),
                 "title": title,
                 "asin": asin,
-                "amazon_price": p,
-                "fee_est($)": fee_amt,
-                "max_buy_price($)": max_buy,
-                "assumption_total_cost($)": total_cost,
-                "risk_reasons": ", ".join(reasons) if reasons else "",
-                "source_category_id": category_id,
+                "brand": brand,
+                "rank": rank,
+                "rating": rating,
+                "ratings_total": ratings_total,
+                "amazon_price": price,
+                "amazon_url": amazon_dp_url(amazon_domain, asin) if asin else "",
+                "risk_flags": risk_flags,
+            }
+        )
+    return rows
+
+
+def run_fast_scan() -> pd.DataFrame:
+    # Build category URL
+    cat_obj = st.session_state.get("selected_category_obj")
+    base_url = build_list_url_from_category(cat_obj, amazon_domain)
+
+    fallback_node = None
+    if cat_obj:
+        cid = cat_obj.get("id") or ""
+        if isinstance(cid, str) and "bestsellers_" in cid:
+            fallback_node = re.sub(r"[^\d]", "", cid.split("bestsellers_", 1)[1])
+
+    list_url = list_url_for_list_type(base_url, amazon_domain, list_type, fallback_node)
+
+    if scan_source == "Category lists (recommended)":
+        if not list_url:
+            raise ValueError("No category URL selected. Use Category Finder → Pick a category, then Run scan.")
+        # Pull pages
+        all_items: List[Dict[str, Any]] = []
+        for p in range(1, list_pages + 1):
+            items = fetch_bestsellers(amazon_domain, list_url, page=p, force_refresh=force_refresh)
+            all_items.extend(items)
+
+        all_items = all_items[:scan_items]
+        rows = normalize_items(all_items, amazon_domain)
+
+    else:
+        # Keyword search
+        if not product_keyword.strip():
+            raise ValueError("Keyword search selected, but keyword is empty. Enter a keyword (sidebar).")
+        all_items = []
+        for p in range(1, list_pages + 1):
+            items = fetch_search(amazon_domain, product_keyword, page=p, force_refresh=force_refresh)
+            all_items.extend(items)
+        all_items = all_items[:scan_items]
+        rows = normalize_items(all_items, amazon_domain)
+
+    cfg = ProfitConfig(
+        fee_pct=fee_pct,
+        fixed_fee=fixed_fee,
+        shipping=shipping_cost,
+        packaging=packaging_cost,
+        sourcing_discount_pct=sourcing_discount,
+        profit_goal=profit_goal,
+        hide_below_goal=hide_below_goal,
+        target_price_min=target_min if use_price_range else None,
+        target_price_max=target_max if use_price_range else None,
+    )
+
+    enriched: List[Dict[str, Any]] = []
+    for r in rows:
+        # Risk exclusion
+        if exclude_risky and r["risk_flags"]:
+            continue
+
+        est = estimate_profitability(r.get("amazon_price"), cfg)
+        r.update(est)
+        r["overall_score"] = overall_score(r)
+        enriched.append(r)
+
+    df = pd.DataFrame(enriched)
+
+    if df.empty:
+        return df
+
+    # Optional hide below goal
+    if hide_below_goal:
+        df = df[df["profit_est"].fillna(-9999) >= float(profit_goal)]
+
+    # Sort
+    df = df.sort_values("overall_score", ascending=False).reset_index(drop=True)
+    return df
+
+
+def deep_dive_products(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    top = df.head(int(deep_dive_n)).copy()
+    details = []
+    for _, row in top.iterrows():
+        asin = row.get("asin")
+        if not asin:
+            continue
+        pdata = fetch_product(
+            amazon_domain=amazon_domain,
+            asin=str(asin),
+            include_summarization_attributes=include_summarization,
+            force_refresh=force_refresh,
+        )
+
+        # Pull a few useful fields
+        product = pdata.get("product") or {}
+        bullets = product.get("feature_bullets") or product.get("feature_bullet") or []
+        bullet_text = " | ".join([str(b) for b in bullets[:5]]) if isinstance(bullets, list) else ""
+
+        customers_say = product.get("customers_say") or product.get("summarization_attributes") or None
+        customers_say_text = ""
+        if customers_say is not None:
+            customers_say_text = str(customers_say)[:600]
+
+        details.append(
+            {
+                "asin": asin,
+                "feature_bullets": bullet_text,
+                "customers_say": customers_say_text,
             }
         )
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        st.warning("No items left after filtering. Try another category, or temporarily disable risk filter.")
-        st.stop()
+    if details:
+        ddf = pd.DataFrame(details)
+        merged = top.merge(ddf, on="asin", how="left")
+        # Put deep fields at end
+        return merged
 
-    min_p, max_p = price_range
-    df["amazon_price"] = pd.to_numeric(df["amazon_price"], errors="coerce")
-    df_show = df[(df["amazon_price"].isna()) | ((df["amazon_price"] >= min_p) & (df["amazon_price"] <= max_p))].copy()
+    return top
 
-    st.subheader("✅ Shortlist candidates")
-    if exclude_risk and filtered_out:
-        st.caption(f"Filtered out {filtered_out} items due to risk keywords.")
 
-    st.dataframe(df_show, use_container_width=True)
+# =========================
+# Rendering
+# =========================
+with tabs[0]:
+    st.subheader("✅ Shortlist candidates (from scan)")
+    st.caption("Click **Run scan** to generate results. Profitability settings affect ranking only unless you turn on hiding below goal.")
 
-    st.download_button(
-        "Download CSV shortlist",
-        df_show.to_csv(index=False).encode("utf-8"),
-        file_name="product_shortlist.csv",
-        mime="text/csv",
+    if run_scan:
+        if not RAINFOREST_API_KEY:
+            st.error("Missing RAINFOREST_API_KEY. Add it to Streamlit Secrets.")
+        else:
+            try:
+                df = run_fast_scan()
+
+                if df.empty:
+                    st.warning(
+                        "No products returned after exclusions.\n\n"
+                        "Try:\n"
+                        "- Pick a different category in Category Finder\n"
+                        "- Switch List type back to Best Sellers\n"
+                        "- Turn OFF risk exclusion temporarily (to test)\n"
+                        "- Increase scan size (30–50)\n"
+                    )
+                    st.session_state["last_df"] = None
+                else:
+                    # Deep dive if selected
+                    if scan_mode == "Deep dive":
+                        df = deep_dive_products(df)
+
+                    st.session_state["last_df"] = df
+
+                    st.success(f"Found {len(df)} ranked candidates. Requests used so far: {st.session_state['requests_used']}")
+
+                    # Show table
+                    show_cols = [
+                        "overall_score",
+                        "title",
+                        "asin",
+                        "amazon_price",
+                        "sell_price_used",
+                        "buy_price_est",
+                        "fees_est",
+                        "profit_est",
+                        "roi_est",
+                        "max_buy_price",
+                        "rating",
+                        "ratings_total",
+                        "risk_flags",
+                        "amazon_url",
+                    ]
+                    show_cols = [c for c in show_cols if c in df.columns]
+
+                    st.dataframe(df[show_cols], use_container_width=True)
+
+                    # Add-to-shortlist UI
+                    st.markdown("### ⭐ Add items to My Shortlist")
+                    options = df["asin"].astype(str).tolist()
+                    picked_asins = st.multiselect("Select ASINs to add", options=options, default=[])
+
+                    if st.button("Add selected to My Shortlist"):
+                        cur = st.session_state["my_shortlist"]
+                        cur_asins = {x.get("asin") for x in cur if isinstance(x, dict)}
+                        for asin in picked_asins:
+                            row = df[df["asin"].astype(str) == str(asin)].head(1)
+                            if row.empty:
+                                continue
+                            rdict = row.iloc[0].to_dict()
+                            if rdict.get("asin") not in cur_asins:
+                                cur.append(rdict)
+                        st.session_state["my_shortlist"] = cur
+                        st.success(f"Added {len(picked_asins)} items (new only).")
+
+                    # Export scan CSV
+                    st.markdown("### ⬇️ Export scan results")
+                    st.download_button(
+                        "Download scan results CSV",
+                        data=df.to_csv(index=False).encode("utf-8"),
+                        file_name="scan_results.csv",
+                        mime="text/csv",
+                    )
+
+            except Exception as e:
+                st.error(f"Scan failed: {e}")
+                st.session_state["last_df"] = None
+    else:
+        st.info("Click **Run scan** to generate results.")
+
+
+with tabs[1]:
+    st.subheader("⭐ My Shortlist")
+    st.caption("This persists within your session. For Streamlit Cloud ‘true persistence’, export/import CSV.")
+
+    cur = st.session_state.get("my_shortlist", [])
+    if not cur:
+        st.info("No items yet. Add items from the Shortlist candidates tab.")
+    else:
+        sdf = pd.DataFrame(cur)
+        # Keep a readable column set
+        keep = [
+            "overall_score",
+            "title",
+            "asin",
+            "amazon_price",
+            "profit_est",
+            "roi_est",
+            "max_buy_price",
+            "rating",
+            "ratings_total",
+            "risk_flags",
+            "amazon_url",
+        ]
+        keep = [c for c in keep if c in sdf.columns]
+        st.dataframe(sdf[keep], use_container_width=True)
+
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("Clear My Shortlist"):
+                st.session_state["my_shortlist"] = []
+                st.success("Cleared.")
+        with c2:
+            st.download_button(
+                "Download My Shortlist CSV",
+                data=sdf.to_csv(index=False).encode("utf-8"),
+                file_name="my_shortlist.csv",
+                mime="text/csv",
+            )
+        with c3:
+            uploaded = st.file_uploader("Import My Shortlist CSV", type=["csv"])
+            if uploaded is not None:
+                try:
+                    idf = pd.read_csv(uploaded)
+                    st.session_state["my_shortlist"] = idf.to_dict(orient="records")
+                    st.success(f"Imported {len(idf)} rows into My Shortlist.")
+                except Exception as e:
+                    st.error(f"Import failed: {e}")
+
+
+with tabs[2]:
+    st.subheader("🧰 Workflows & Lead Gen")
+    st.caption("These are copy/paste workflows to reduce wasted API requests and move faster to sourcing & validation.")
+
+    st.markdown("### 1) eBay sold-price check (manual workflow)")
+    st.code(
+        "Use these searches (copy/paste into Google) for a quick sold-price reality check:\n"
+        "1) site:ebay.com sold \"<product name>\" \n"
+        "2) site:ebay.com \"<asin>\" sold\n"
+        "3) \"<product name>\" \"sold items\" ebay\n"
+        "Then open eBay → filter: Sold items / Completed items / US-only.\n",
+        language="text",
     )
 
-    st.subheader("🧩 Supplier lead generator (US wholesalers first)")
-    st.write("Copy/paste these Google queries:")
-    top_titles = df_show["title"].head(5).tolist()
-    for t in top_titles:
-        st.code(
-            "\n".join(
-                [
-                    f"wholesale \"{t}\" USA",
-                    f"distributor \"{t}\" USA",
-                    f"bulk supplier \"{t}\" USA",
-                    f"\"{t}\" private label USA",
-                    f"site:faire.com \"{t}\"",
-                    f"site:thomasnet.com \"{t}\"",
-                ]
-            ),
-            language="text",
-        )
+    st.markdown("### 2) Supplier lead generator (US wholesalers first)")
+    st.code(
+        "For each shortlisted product title, run these Google searches:\n"
+        "- \"<product>\" wholesale USA\n"
+        "- \"<product>\" distributor USA\n"
+        "- \"<product>\" bulk supplier USA\n"
+        "- site:faire.com \"<product>\"\n"
+        "- site:thomasnet.com \"<product>\"\n"
+        "- site:tundra.com \"<product>\"\n"
+        "\nIf you’re sourcing from Pakistan/Alibaba, also run:\n"
+        "- \"<product>\" manufacturer Pakistan\n"
+        "- \"<product>\" Alibaba\n",
+        language="text",
+    )
 
-    st.subheader("🟦 eBay sold-price check (manual workflow)")
-    st.write("eBay → search product → enable **Sold items** + **Completed items** → compare sold prices vs Max Buy Price.")
-    st.code("\n".join([f"eBay sold listings \"{t}\"" for t in top_titles]), language="text")
+    st.markdown("### 3) Bundle ideas generator (simple heuristic)")
+    st.write(
+        "Bundle rule-of-thumb: pair the main item with a **consumable**, a **replacement part**, or a **storage/organizer**.\n"
+        "Example: kitchen organizer → labels / liners / microfiber cloths."
+    )
 
-    if scan_mode == "Deep dive":
-        st.subheader("🔍 Deep dive (critical reviews)")
-        top_for_reviews = df_show.head(deep_reviews_n).to_dict("records")
-        for rec in top_for_reviews:
-            title = rec["title"]
-            asin = rec["asin"]
-            if not asin:
-                st.info(f"Skipping reviews (missing ASIN): {title[:60]}")
-                continue
-            with st.spinner(f"Fetching critical reviews: {title[:60]}..."):
-                try:
-                    crit = fetch_critical_reviews(RAINFOREST_API_KEY, domain, asin, max_reviews=25)
-                except Exception as e:
-                    st.warning(f"Could not fetch reviews for {asin}: {e}")
-                    continue
+    st.markdown("### 4) Request discipline (how to not burn 100 credits)")
+    st.write(
+        "- Use **Category Finder** only when you’re switching niches. Cache will prevent repeat costs unless you Force refresh.\n"
+        "- Default scans: **30 items** (usually 1 page) → quick signal.\n"
+        "- Only use **Deep dive** on top **3–6** candidates.\n"
+        "- Keep risk exclusion ON during exploration; turn OFF only when debugging ‘why no results’."
+    )
 
-            st.markdown(f"**{title}**  \nASIN: `{asin}`  \nCritical reviews fetched: {len(crit)}")
-            if enable_ai:
-                with st.spinner("Running AI gap analysis..."):
-                    st.write(ai_gap_insights(title, crit))
-            else:
-                st.caption("AI insights disabled.")
 
-    with st.expander("How to use your 100-request trial without wasting it"):
-        st.markdown(
-            """
-- Think of **1 API call = 1 request**. A single **Run scan** can cost **1+** requests depending on Deep Dive.
-- Start wide: **Fast scan + 15 items** across many categories.
-- Go deep only on winners: Deep dive **3–5 items** for review-gap insights.
-- Use Category Finder sparingly: search broad terms, then reuse the found category_id.
-            """
-        )
-
-# Catch-all exception -> shows on page (prevents blank)
-try:
-    main()
-except Exception as e:
-    st.error("The app crashed while rendering. The exact error is shown below.")
-    st.exception(e)
+# Footer
+st.caption(f"Session requests used: {st.session_state['requests_used']}")
