@@ -22,18 +22,23 @@ STATE_PATH = STORAGE_DIR / "state.json"
 CACHE_DIR = STORAGE_DIR / "cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Broad heuristics (auto-exclude these during scanning)
-RISK_KEYWORDS = {
-    "brand-heavy": [
-        "apple", "samsung", "sony", "nintendo", "disney", "lego", "dyson", "yeti", "stanley", "kitchenaid",
-        "keurig", "breville", "bosch", "dewalt", "milwaukee", "makita",
-    ],
-    "supplement": [
-        "supplement", "vitamin", "capsule", "tablet", "softgel", "gummies", "omega", "probiotic", "creatine",
-        "whey", "collagen", "ashwagandha",
-    ],
-    "medical/test": [
-        "test kit", "diagnostic", "glucose", "blood pressure", "bp monitor", "pulse oximeter", "covid", "pregnancy",
-    ],
-    "hazmat-ish": [
-        "aerosol", "propane", "butane", "fuel", "flammable", "corrosive", "acid", "ble
+# --- Risk / restriction keyword filters (exclude these from results) ---
+RISK_KEYWORDS = [
+    # Supplements / ingestibles
+    "supplement", "vitamin", "capsule", "softgel", "tablet", "gummy", "probiotic", "creatine",
+    "protein powder", "weight loss", "keto", "detox", "herbal", "dietary",
+
+    # Medical / tests / healthcare
+    "blood test", "test kit", "diagnostic", "medical", "medicine", "pharmacy", "clinical",
+    "covid", "glucose", "insulin", "thermometer", "bp monitor", "pregnancy test",
+
+    # Hazmat-ish / chemicals / flammables
+    "aerosol", "spray can", "propane", "butane", "fuel", "flammable", "corrosive",
+    "acid", "bleach", "solvent", "paint thinner", "hazmat", "toxic",
+
+    # Weapon-like
+    "knife", "dagger", "sword", "machete", "weapon", "ammo", "munition", "gun",
+
+    # Brand-heavy cue words (not perfect, but helps)
+    "yeti", "vtech", "fellowes", "carlyle", "nature made", "rit dye", "wonka",
+]
