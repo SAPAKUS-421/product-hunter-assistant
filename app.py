@@ -203,29 +203,6 @@ def safe_cache_key(url: str, params: Dict[str, Any]) -> str:
         safe_params["api_key"] = "REDACTED"
     parts = [url] + [f"{k}={safe_params[k]}" for k in sorted(safe_params.keys())]
     return "||".join(parts)
-    
-def rainforest_get_json(
-    endpoint: str,
-    params: Dict[str, Any],
-    force_refresh: bool,
-    count_request: bool = True,
-    timeout: int = 30,
-) -> Dict[str, Any]:
-    """
-    Small in-session cache to avoid wasting trial requests.
-    If force_refresh is False and cached result exists, returns cached (no request count).
-    """
-    url = f"{RAINFOREST_BASE}{endpoint}"
-    params2 = dict(params)
-
-    if "api_key" not in params2:
-        params2["api_key"] = RAINFOREST_API_KEY
-
-    key = safe_cache_key(url, params2)
-    if not force_refresh and key in st.session_state["api_cache"]:
-        _, cached = st.session_state["api_cache"][key]
-        return cached
-
 def rainforest_get_json(
     endpoint: str,
     params: Dict[str, Any],
