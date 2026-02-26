@@ -383,22 +383,12 @@ def list_url_for_list_type(base_url: Optional[str], amazon_domain: str, list_typ
     return base_url
 
 
-def fetch_bestsellers(
-    amazon_domain: str,
-    url: str,
-    page: int,
-    force_refresh: bool,
-) -> List[Dict[str, Any]]:
-    """
-    Product Data API: type=bestsellers with url & page
-    Endpoint: /request
-    """
+def fetch_bestsellers(amazon_domain: str, url: str, page: int, force_refresh: bool) -> List[Dict[str, Any]]:
     data = rainforest_get_json(
         endpoint="/request",
         params={
             "type": "bestsellers",
-            "amazon_domain": amazon_domain,
-            "url": url,
+            "url": url,      # ✅ url defines domain, so omit amazon_domain
             "page": page,
         },
         force_refresh=force_refresh,
@@ -406,7 +396,6 @@ def fetch_bestsellers(
     )
     items = data.get("bestsellers") or []
     return [x for x in items if isinstance(x, dict)]
-
 
 def fetch_search(
     amazon_domain: str,
