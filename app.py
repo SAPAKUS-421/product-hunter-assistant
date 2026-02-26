@@ -226,7 +226,7 @@ def rainforest_get_json(
         _, cached = st.session_state["api_cache"][key]
         return cached
 
-    def rainforest_get_json(
+def rainforest_get_json(
     endpoint: str,
     params: Dict[str, Any],
     force_refresh: bool,
@@ -245,55 +245,55 @@ def rainforest_get_json(
     if "api_key" not in params2:
         params2["api_key"] = RAINFOREST_API_KEY
 
-    # Use SAFE cache key (redacts api_key)
     key = safe_cache_key(url, params2)
+
     if not force_refresh and key in st.session_state["api_cache"]:
         _, cached = st.session_state["api_cache"][key]
         return cached
 
     try:
-    r = requests.get(url, params=params2, timeout=timeout)
-except requests.RequestException as e:
-    raise RuntimeError(f"Network error contacting Rainforest: {e.__class__.__name__}")
+        r = requests.get(url, params=params2, timeout=timeout)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network error contacting Rainforest: {e.__class__.__name__}")
 
-# Try to parse JSON even on HTTP errors
-data = None
-try:
-    data = r.json()
-except Exception:
+    # Try to parse JSON even on HTTP errors
     data = None
+    try:
+        data = r.json()
+    except Exception:
+        data = None
 
-# If Rainforest returns structured request_info, use it
-if isinstance(data, dict) and "request_info" in data:
-    ri = data.get("request_info") or {}
-    success = ri.get("success", True)
-    msg = str(ri.get("message") or "").strip()
+    # If Rainforest returns structured request_info, use it
+    if isinstance(data, dict) and "request_info" in data:
+        ri = data.get("request_info") or {}
+        success = ri.get("success", True)
+        msg = str(ri.get("message") or "").strip()
 
-    if success is False:
-        lower = msg.lower()
+        if success is False:
+            lower = msg.lower()
 
-        if "temporarily suspended" in lower:
-            raise RuntimeError(
-                "Rainforest says your account is temporarily suspended. "
-                "Open Rainforest Dashboard → API Playground to confirm, then contact support to reinstate."
-            )
+            if "temporarily suspended" in lower:
+                raise RuntimeError(
+                    "Rainforest says your account is temporarily suspended. "
+                    "Open Rainforest Dashboard → API Playground to confirm, then contact support to reinstate."
+                )
 
-        # Generic structured error
-        raise RuntimeError(f"Rainforest error: {redact_api_key(msg)}")
+            # Generic structured error
+            raise RuntimeError(f"Rainforest error: {redact_api_key(msg)}")
 
-# If still an HTTP error and no structured JSON, raise a redacted URL error
-if r.status_code >= 400:
-    raise RuntimeError(f"Rainforest HTTP {r.status_code}. URL: {redact_api_key(r.url)}")
+    # If still an HTTP error and no structured JSON, raise a redacted URL error
+    if r.status_code >= 400:
+        raise RuntimeError(f"Rainforest HTTP {r.status_code}. URL: {redact_api_key(r.url)}")
 
-# Success path
-if not isinstance(data, dict):
-    data = {}
+    # Success path
+    if not isinstance(data, dict):
+        data = {}
 
-st.session_state["api_cache"][key] = (time.time(), data)
-if count_request:
-    st.session_state["requests_used"] += 1
-return data
+    st.session_state["api_cache"][key] = (time.time(), data)
+    if count_request:
+        st.session_state["requests_used"] += 1
 
+    return data
 def estimate_requests_scan(
     scan_mode: str,
     list_pages: int,
