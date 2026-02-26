@@ -1,7 +1,7 @@
 import math
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -30,16 +30,11 @@ def get_secret(key: str, default: str = "") -> str:
 
 
 RAINFOREST_API_KEY = get_secret("RAINFOREST_API_KEY")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # optional
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")  # optional (not used in this build)
 OPENAI_MODEL = get_secret("OPENAI_MODEL", "gpt-4o-mini")
 
-
-# ==========================================
-# Constants
-# ==========================================
 RAINFOREST_BASE = "https://api.rainforestapi.com"
-
-ITEMS_PER_PAGE = 50  # typical bestsellers/search page size
+ITEMS_PER_PAGE = 50  # typical page size for bestsellers/search
 
 
 # ==========================================
@@ -49,7 +44,7 @@ def init_state() -> None:
     st.session_state.setdefault("requests_used", 0)
     st.session_state.setdefault("api_cache", {})  # safe cache key -> (timestamp, json)
     st.session_state.setdefault("category_results", [])
-    st.session_state.setdefault("selected_category_obj", None)
+    st.session_state.setdefault("selected_category", None)
     st.session_state.setdefault("last_df", None)
     st.session_state.setdefault("my_shortlist", [])
 
@@ -58,17 +53,15 @@ init_state()
 
 
 # ==========================================
-# Safety: redact keys in errors + safe caching
+# Safety: redact keys + safe cache key
 # ==========================================
 def redact_api_key(text: str) -> str:
-    """Redact api_key=... inside any URL/text."""
     if not text:
         return text
     return re.sub(r"(api_key=)([^&\s]+)", r"\1****REDACTED****", str(text))
 
 
 def safe_cache_key(url: str, params: Dict[str, Any]) -> str:
-    """Cache key without storing sensitive api_key value."""
     safe_params = dict(params)
     if "api_key" in safe_params:
         safe_params["api_key"] = "REDACTED"
@@ -86,17 +79,15 @@ def rainforest_get_json(
     """
     Safe Rainforest caller:
     - Never leaks api_key in error messages
-    - Detects 'temporarily suspended' messages and shows a clean instruction
-    - Uses in-session cache without storing real api_key in cache key
+    - Shows clean 'temporarily suspended' messaging
+    - Uses in-session cache without storing the real api_key
     """
     if not RAINFOREST_API_KEY:
         raise RuntimeError("Missing RAINFOREST_API_KEY in Streamlit Secrets.")
 
     url = f"{RAINFOREST_BASE}{endpoint}"
     params2 = dict(params)
-
-    if "api_key" not in params2:
-        params2["api_key"] = RAINFOREST_API_KEY
+    params2["api_key"] = RAINFOREST_API_KEY
 
     key = safe_cache_key(url, params2)
 
@@ -109,14 +100,14 @@ def rainforest_get_json(
     except requests.RequestException as e:
         raise RuntimeError(f"Network error contacting Rainforest: {e.__class__.__name__}")
 
-    # Try to parse JSON even on HTTP errors
+    # Try parse JSON even on errors
     data = None
     try:
         data = r.json()
     except Exception:
         data = None
 
-    # Structured message handling
+    # Structured Rainforest errors
     if isinstance(data, dict) and "request_info" in data:
         ri = data.get("request_info") or {}
         success = ri.get("success", True)
@@ -127,11 +118,11 @@ def rainforest_get_json(
             if "temporarily suspended" in lower:
                 raise RuntimeError(
                     "Rainforest says your account is temporarily suspended. "
-                    "Open Rainforest Dashboard → API Playground to confirm, then contact support to reinstate."
+                    "Check API Playground, then contact Rainforest support to reinstate."
                 )
             raise RuntimeError(f"Rainforest error: {redact_api_key(msg)}")
 
-    # Generic HTTP error fallback
+    # HTTP fallback
     if r.status_code >= 400:
         raise RuntimeError(f"Rainforest HTTP {r.status_code}. URL: {redact_api_key(r.url)}")
 
@@ -175,7 +166,7 @@ RISK_GROUPS = {
 }
 
 
-def risk_flags(title: str, brand: str = "") -> List[str]:
+def compute_risk_flags(title: str, brand: str = "") -> List[str]:
     t = (title or "").lower()
     b = (brand or "").lower()
     flags = []
@@ -195,17 +186,28 @@ def risk_flags(title: str, brand: str = "") -> List[str]:
 
 
 # ==========================================
-# Categories API (STANDARD) + filter Renewed
+# Category Finder using Categories API (correct)
+# Categories API types supported:
+# standard, bestsellers, gift ideas, most wished for, movers and shakers, new releases, deals
 # ==========================================
-def categories_search_standard(domain: str, search_term: str, force_refresh: bool, include_renewed: bool) -> List[Dict[str, Any]]:
+LISTTYPE_TO_CATEGORIES_TYPE = {
+    "Best Sellers": "bestsellers",
+    "Trending (Movers & Shakers)": "movers and shakers",
+    "New Releases": "new releases",
+    "Most Wished For": "most wished for",
+    "Gift Ideas": "gift ideas",
+}
+
+
+def categories_search(domain: str, cat_type: str, search_term: str, force_refresh: bool) -> List[Dict[str, Any]]:
     if not search_term.strip():
         return []
 
     data = rainforest_get_json(
         endpoint="/categories",
         params={
-            "domain": domain,          # correct parameter name for /categories
-            "type": "standard",        # real category tree
+            "domain": domain,
+            "type": cat_type,
             "search_term": search_term.strip(),
         },
         force_refresh=force_refresh,
@@ -213,90 +215,50 @@ def categories_search_standard(domain: str, search_term: str, force_refresh: boo
     )
 
     cats = data.get("categories") or []
-    seen = set()
     out = []
-
+    seen = set()
     for c in cats:
         if not isinstance(c, dict):
             continue
         cid = str(c.get("id") or "").strip()
         if not cid or cid in seen:
             continue
-
-        name = str(c.get("name") or c.get("title") or c.get("path") or "").strip()
-        name_lower = name.lower()
-
-        if not include_renewed and "renewed" in name_lower:
-            continue
-
         seen.add(cid)
         out.append(c)
-
     return out
 
 
-def category_label(c: Dict[str, Any]) -> str:
-    name = str(c.get("path") or c.get("name") or c.get("title") or "Category").strip()
+def cat_label(c: Dict[str, Any]) -> str:
+    path = str(c.get("path") or c.get("name") or "Category").strip()
     cid = str(c.get("id") or "").strip()
-    return f"{name} | {cid}"
-
-
-def build_node_from_category(cat_obj: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not cat_obj or not isinstance(cat_obj, dict):
-        return None
-    cid = str(cat_obj.get("id") or "").strip()
-    node = re.sub(r"[^\d]", "", cid)
-    return node if node else None
-
-
-def list_url_for_node(amazon_domain: str, node: str, list_type: str) -> str:
-    list_type = list_type.strip()
-    if list_type == "Best Sellers":
-        return f"https://www.{amazon_domain}/Best-Sellers/zgbs/?node={node}"
-    if list_type == "Trending (Movers & Shakers)":
-        return f"https://www.{amazon_domain}/gp/movers-and-shakers/?node={node}"
-    if list_type == "New Releases":
-        return f"https://www.{amazon_domain}/gp/new-releases/?node={node}"
-    if list_type == "Most Wished For":
-        return f"https://www.{amazon_domain}/gp/most-wished-for/?node={node}"
-    if list_type == "Most Gifted":
-        return f"https://www.{amazon_domain}/gp/most-gifted/?node={node}"
-    # fallback
-    return f"https://www.{amazon_domain}/Best-Sellers/zgbs/?node={node}"
+    return f"{path} | {cid}"
 
 
 # ==========================================
-# Product list fetchers
+# Bestsellers request using category_id + amazon_domain (official method)
 # ==========================================
-def fetch_bestsellers(url: str, page: int, force_refresh: bool) -> List[Dict[str, Any]]:
-    """
-    IMPORTANT: When using `url`, do NOT include `amazon_domain` (Rainforest rejects the combo).
-    """
+def fetch_bestsellers_by_category(domain: str, category_id: str, page: int, force_refresh: bool) -> List[Dict[str, Any]]:
     data = rainforest_get_json(
         endpoint="/request",
         params={
             "type": "bestsellers",
-            "url": url,
+            "amazon_domain": domain,
+            "category_id": category_id,
             "page": page,
         },
         force_refresh=force_refresh,
         count_request=True,
     )
-    items = (
-        data.get("bestsellers")
-        or data.get("best_sellers")
-        or data.get("items")
-        or []
-    )
+    items = data.get("bestsellers") or []
     return [x for x in items if isinstance(x, dict)]
 
 
-def fetch_search(amazon_domain: str, search_term: str, page: int, force_refresh: bool) -> List[Dict[str, Any]]:
+def fetch_search(domain: str, search_term: str, page: int, force_refresh: bool) -> List[Dict[str, Any]]:
     data = rainforest_get_json(
         endpoint="/request",
         params={
             "type": "search",
-            "amazon_domain": amazon_domain,
+            "amazon_domain": domain,
             "search_term": search_term.strip(),
             "page": page,
         },
@@ -307,59 +269,53 @@ def fetch_search(amazon_domain: str, search_term: str, page: int, force_refresh:
     return [x for x in items if isinstance(x, dict)]
 
 
-def normalize_items(raw_items: List[Dict[str, Any]], amazon_domain: str) -> List[Dict[str, Any]]:
-    rows = []
+def normalize_items(raw_items: List[Dict[str, Any]], domain: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
     for idx, it in enumerate(raw_items, start=1):
-        asin = it.get("asin") or it.get("product_asin") or it.get("parent_asin")
         title = it.get("title") or it.get("name") or ""
+        asin = it.get("asin") or it.get("product_asin") or it.get("parent_asin")
         brand = it.get("brand") or ""
         rank = it.get("rank") or idx
         rating = it.get("rating")
-        ratings_total = it.get("ratings_total") or it.get("reviews_total") or it.get("ratings") or 0
+        ratings_total = it.get("ratings_total") or it.get("reviews_total") or 0
 
         price = None
         if isinstance(it.get("price"), dict):
             price = it["price"].get("value")
         elif it.get("price") is not None:
             price = it.get("price")
-
         try:
             price = float(price) if price is not None else None
         except Exception:
             price = None
 
-        flags = risk_flags(title, brand)
+        flags = compute_risk_flags(str(title), str(brand))
 
-        rows.append({
-            "rank": rank,
-            "title": title,
-            "asin": asin,
-            "brand": brand,
-            "amazon_price": price,
-            "rating": rating,
-            "ratings_total": ratings_total,
-            "risk_flags": ", ".join(flags) if flags else "",
-            "amazon_url": f"https://www.{amazon_domain}/dp/{asin}" if asin else "",
-        })
+        rows.append(
+            {
+                "rank": rank,
+                "title": title,
+                "asin": asin,
+                "brand": brand,
+                "amazon_price": price,
+                "rating": rating,
+                "ratings_total": ratings_total,
+                "risk_flags": ", ".join(flags) if flags else "",
+                "amazon_url": f"https://www.{domain}/dp/{asin}" if asin else "",
+            }
+        )
     return rows
 
 
-# ==========================================
-# Request planning
-# ==========================================
-def estimate_requests(scan_items: int, deep_mode: str, deep_n: int) -> int:
-    list_pages = max(1, math.ceil(scan_items / ITEMS_PER_PAGE))
-    est = list_pages
-    if deep_mode != "Off":
-        est += deep_n  # 1 extra call per item (product details or reviews)
-    return est
+def estimate_requests_for_scan(scan_items: int) -> int:
+    return max(1, math.ceil(scan_items / ITEMS_PER_PAGE))
 
 
 # ==========================================
 # UI
 # ==========================================
 st.title("🧭 Product Hunter Assistant (USA Market)")
-st.caption("Discover what’s selling by category or keyword. Risky items excluded by default. No profit filters.")
+st.caption("This build uses Rainforest’s official Bestsellers method: category_id + amazon_domain. No profit assumptions.")
 
 
 # Sidebar
@@ -381,14 +337,16 @@ scan_source = st.sidebar.selectbox(
 
 list_type = st.sidebar.selectbox(
     "List type",
-    ["Best Sellers", "Trending (Movers & Shakers)", "New Releases", "Most Wished For", "Most Gifted"],
+    ["Best Sellers", "Trending (Movers & Shakers)", "New Releases", "Most Wished For", "Gift Ideas"],
     index=0,
 )
 
-st.sidebar.markdown("### Category Finder (STANDARD)")
-include_renewed = st.sidebar.checkbox("Include Renewed categories", value=False)
+exclude_renewed = st.sidebar.checkbox("Hide Renewed categories", value=True)
+
+st.sidebar.markdown("### Category Finder")
+cat_type = LISTTYPE_TO_CATEGORIES_TYPE[list_type]
 cat_search_term = st.sidebar.text_input(
-    "Category search term",
+    "Search term",
     value=st.session_state.get("cat_search_term", "Kitchen & Dining"),
     placeholder="Try: Kitchen & Dining / Storage & Organization / Pet Supplies / Tools",
 )
@@ -396,12 +354,14 @@ st.session_state["cat_search_term"] = cat_search_term
 
 if st.sidebar.button("Search categories"):
     try:
-        cats = categories_search_standard(
+        cats = categories_search(
             domain=amazon_domain,
+            cat_type=cat_type,
             search_term=cat_search_term,
             force_refresh=force_refresh,
-            include_renewed=include_renewed,
         )
+        if exclude_renewed:
+            cats = [c for c in cats if "renewed" not in str(c.get("path") or c.get("name") or "").lower()]
         st.session_state["category_results"] = cats
         if not cats:
             st.sidebar.warning("No categories found. Try a different term (Kitchen / Storage / Pet / Tools).")
@@ -411,9 +371,8 @@ if st.sidebar.button("Search categories"):
         st.sidebar.error(redact_api_key(str(e)))
 
 category_options = st.session_state.get("category_results", [])
-selected_cat = None
 if category_options:
-    labels = [category_label(c) for c in category_options]
+    labels = [cat_label(c) for c in category_options]
     picked_idx = st.sidebar.selectbox(
         "Pick a category",
         options=list(range(len(labels))),
@@ -422,100 +381,76 @@ if category_options:
         key="picked_category_index",
     )
     selected_cat = category_options[int(picked_idx)]
-    st.session_state["selected_category_obj"] = selected_cat
+    st.session_state["selected_category"] = selected_cat
 
-    node = build_node_from_category(selected_cat) or ""
-    st.sidebar.markdown("**Selected node (copyable)**")
-    st.sidebar.code(node if node else "—")
-
-    if node:
-        st.sidebar.markdown("**Generated list URL (copyable)**")
-        st.sidebar.code(list_url_for_node(amazon_domain, node, list_type))
+    selected_id = str(selected_cat.get("id") or "").strip()
+    st.sidebar.markdown("**Selected category_id (copyable)**")
+    st.sidebar.code(selected_id if selected_id else "—")
 else:
-    st.sidebar.info("Search and pick a category to scan.")
+    st.sidebar.info("Search and pick a category before running a category scan.")
 
-st.sidebar.markdown("### Keyword (optional)")
+st.sidebar.markdown("### Keyword (only for keyword scan)")
 keyword = st.sidebar.text_input(
-    "Keyword for search scan",
+    "Keyword",
     value="",
-    placeholder="e.g., magnetic calendar / kitchen organizer / dog toy",
+    placeholder="e.g., kitchen organizer / magnetic calendar / dog toy",
 )
 
-st.sidebar.markdown("### Scan size + planning")
-scan_items = st.sidebar.slider("How many items to scan", min_value=10, max_value=100, value=50, step=10)
-
-deep_mode = st.sidebar.selectbox(
-    "Deep dive",
-    ["Off", "Product details", "Critical reviews"],
-    index=0,
-    help="Optional. Costs extra requests. Use after you see a good shortlist.",
-)
-deep_n = 0
-if deep_mode != "Off":
-    deep_n = st.sidebar.slider("Deep dive top N", min_value=3, max_value=15, value=5, step=1)
-
-st.sidebar.markdown("### Risk filters")
-exclude_risky = st.sidebar.checkbox(
-    "Exclude risk-flagged items",
-    value=True,
-    help="brand-heavy / supplement / medical-test / hazmat-ish / weapon-like",
-)
-
-price_filter_on = st.sidebar.checkbox("Filter by price range (optional)", value=False)
+st.sidebar.markdown("### Filters")
+exclude_risky = st.sidebar.checkbox("Exclude risk-flagged items", value=True)
+price_filter_on = st.sidebar.checkbox("Filter by price range", value=False)
 min_price = max_price = None
 if price_filter_on:
     c1, c2 = st.sidebar.columns(2)
     with c1:
-        min_price = st.number_input("Min price", min_value=0.0, value=0.0, step=1.0)
+        min_price = st.number_input("Min", min_value=0.0, value=0.0, step=1.0)
     with c2:
-        max_price = st.number_input("Max price", min_value=0.0, value=200.0, step=1.0)
+        max_price = st.number_input("Max", min_value=0.0, value=200.0, step=1.0)
 
-est = estimate_requests(scan_items, deep_mode, deep_n)
+st.sidebar.markdown("### Scan size + request planning")
+scan_items = st.sidebar.slider("Items to scan", min_value=10, max_value=100, value=50, step=10)
+est_req = estimate_requests_for_scan(scan_items)
 st.sidebar.info(
-    f"Estimated requests this scan: ~{est}\n\n"
-    f"Requests used this session: {st.session_state['requests_used']}"
+    f"Estimated requests for this scan: ~{est_req}\n\nRequests used this session: {st.session_state['requests_used']}"
 )
 
 st.sidebar.markdown("### Keys status")
 st.sidebar.write(("✅" if RAINFOREST_API_KEY else "❌") + " RAINFOREST_API_KEY")
-st.sidebar.write(("✅" if OPENAI_API_KEY else "⚪") + " OPENAI_API_KEY (optional)")
+st.sidebar.write(("✅" if OPENAI_API_KEY else "⚪") + " OPENAI_API_KEY (unused in this build)")
 
 
-# Main controls
 run_scan = st.button("🚀 Run scan", type="primary")
 tabs = st.tabs(["✅ Results", "⭐ My Shortlist", "🧰 Workflows"])
 
 
 def run_scan_logic() -> pd.DataFrame:
-    # Get items
+    pages = estimate_requests_for_scan(scan_items)
+
+    raw_items: List[Dict[str, Any]] = []
+
     if scan_source == "Category lists (recommended)":
-        cat_obj = st.session_state.get("selected_category_obj")
-        node = build_node_from_category(cat_obj)
-        if not node:
-            raise RuntimeError("Pick a category first (Category Finder → Search → Pick).")
+        sel = st.session_state.get("selected_category")
+        if not sel:
+            raise RuntimeError("Pick a category first: Category Finder → Search → Pick.")
 
-        list_url = list_url_for_node(amazon_domain, node, list_type)
+        category_id = str(sel.get("id") or "").strip()
+        if not category_id:
+            raise RuntimeError("Selected category has no id. Pick a different category from the list.")
 
-        list_pages = max(1, math.ceil(scan_items / ITEMS_PER_PAGE))
-        all_items: List[Dict[str, Any]] = []
-        for p in range(1, list_pages + 1):
-            all_items.extend(fetch_bestsellers(list_url, page=p, force_refresh=force_refresh))
-
-        all_items = all_items[:scan_items]
-        rows = normalize_items(all_items, amazon_domain)
+        for p in range(1, pages + 1):
+            raw_items.extend(fetch_bestsellers_by_category(amazon_domain, category_id, page=p, force_refresh=force_refresh))
 
     else:
         if not keyword.strip():
             raise RuntimeError("Keyword search selected, but keyword is empty.")
-        list_pages = max(1, math.ceil(scan_items / ITEMS_PER_PAGE))
-        all_items = []
-        for p in range(1, list_pages + 1):
-            all_items.extend(fetch_search(amazon_domain, keyword, page=p, force_refresh=force_refresh))
-        all_items = all_items[:scan_items]
-        rows = normalize_items(all_items, amazon_domain)
+        for p in range(1, pages + 1):
+            raw_items.extend(fetch_search(amazon_domain, keyword, page=p, force_refresh=force_refresh))
 
-    # Apply exclusions / filters
-    out = []
+    raw_items = raw_items[:scan_items]
+    rows = normalize_items(raw_items, amazon_domain)
+
+    # Apply filters
+    kept = []
     for r in rows:
         if exclude_risky and r.get("risk_flags"):
             continue
@@ -526,22 +461,21 @@ def run_scan_logic() -> pd.DataFrame:
             if max_price is not None and r["amazon_price"] > float(max_price):
                 continue
 
-        out.append(r)
+        kept.append(r)
 
-    df = pd.DataFrame(out)
+    df = pd.DataFrame(kept)
     if df.empty:
         return df
 
-    # Sort: lowest rank first if rank is numeric-ish
-    def _rank_val(x):
+    # sort by rank ascending (best first)
+    def _rank(x):
         try:
             return int(str(x).replace(",", ""))
         except Exception:
             return 10**9
 
-    df["__rank"] = df["rank"].apply(_rank_val)
+    df["__rank"] = df["rank"].apply(_rank)
     df = df.sort_values("__rank", ascending=True).drop(columns=["__rank"]).reset_index(drop=True)
-
     return df
 
 
@@ -559,14 +493,13 @@ with tabs[0]:
                     "Try:\n"
                     "- Turn OFF risk exclusion (test)\n"
                     "- Turn OFF price filter\n"
-                    "- Use a different category search term (Kitchen & Dining / Storage & Organization)\n"
-                    "- Switch scan source to Keyword search with a specific keyword\n"
+                    "- Search a more specific category term (Storage & Organization / Bakeware)\n"
+                    "- Switch to Keyword search (this confirms the API is working)\n"
                 )
             else:
                 st.success(f"Found {len(df)} items. Requests used this session: {st.session_state['requests_used']}")
 
                 show_cols = ["rank", "title", "asin", "amazon_price", "rating", "ratings_total", "risk_flags", "amazon_url"]
-                show_cols = [c for c in show_cols if c in df.columns]
                 st.dataframe(df[show_cols], use_container_width=True)
 
                 st.download_button(
@@ -608,7 +541,6 @@ with tabs[1]:
     else:
         sdf = pd.DataFrame(cur)
         keep = ["rank", "title", "asin", "amazon_price", "rating", "ratings_total", "risk_flags", "amazon_url"]
-        keep = [c for c in keep if c in sdf.columns]
         st.dataframe(sdf[keep], use_container_width=True)
 
         c1, c2, c3 = st.columns([1, 1, 2])
@@ -658,24 +590,26 @@ with tabs[2]:
                 continue
             st.markdown(f"**{t[:90]}**")
             st.code(
-                "\n".join([
-                    f'wholesale "{t}" USA',
-                    f'distributor "{t}" USA',
-                    f'bulk supplier "{t}" USA',
-                    f'site:faire.com "{t}"',
-                    f'site:tundra.com "{t}"',
-                    f'site:thomasnet.com "{t}"',
-                ]),
+                "\n".join(
+                    [
+                        f'wholesale "{t}" USA',
+                        f'distributor "{t}" USA',
+                        f'bulk supplier "{t}" USA',
+                        f'site:faire.com "{t}"',
+                        f'site:tundra.com "{t}"',
+                        f'site:thomasnet.com "{t}"',
+                    ]
+                ),
                 language="text",
             )
     else:
         st.info("Run a scan first to generate supplier searches from the top results.")
 
-    st.markdown("### Trial-usage discipline (don’t burn 100 requests)")
+    st.markdown("### Trial discipline (don’t burn requests)")
     st.write(
-        "- Use Category Finder only when changing niches.\n"
-        "- Scan 50 items (usually 1 request per list page).\n"
-        "- Use Keyword search for narrow product hunting.\n"
+        "- Use Category Finder only when switching niches.\n"
+        "- Scan 50 items first.\n"
+        "- Use Keyword search to confirm API health.\n"
         "- Keep risk exclusion ON during exploration.\n"
     )
 
