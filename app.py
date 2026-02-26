@@ -293,15 +293,10 @@ def estimate_requests_scan(
 # =========================
 # Rainforest adapters
 # =========================
-def categories_search_bestsellers(
-    amazon_domain: str,
-    search_term: str,
-    force_refresh: bool,
-) -> List[Dict[str, Any]]:
+def categories_search_standard(domain: str, search_term: str, force_refresh: bool) -> List[Dict[str, Any]]:
     """
-    Categories API (bestsellers).
-    Endpoint commonly: /categories
-    Params per TrajectData docs: type=bestsellers, amazon_domain, search_term
+    Categories API uses `domain` and supports `type=standard` to return real category tree nodes.
+    Docs: /categories parameters include api_key, domain, type, search_term. :contentReference[oaicite:2]{index=2}
     """
     if not search_term.strip():
         return []
@@ -309,8 +304,8 @@ def categories_search_bestsellers(
     data = rainforest_get_json(
         endpoint="/categories",
         params={
-            "type": "bestsellers",
-            "amazon_domain": amazon_domain,
+            "domain": domain,          # ✅ correct param name
+            "type": "standard",        # ✅ real categories
             "search_term": search_term.strip(),
         },
         force_refresh=force_refresh,
@@ -318,26 +313,36 @@ def categories_search_bestsellers(
     )
 
     cats = data.get("categories") or []
-    # ensure dicts
-    return [c for c in cats if isinstance(c, dict)]
+    # De-duplicate by id (prevents repeated entries)
+    seen = set()
+    out = []
+    for c in cats:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(c)
+    return out
 
 
 def build_list_url_from_category(cat_obj: Optional[Dict[str, Any]], amazon_domain: str) -> Optional[str]:
     """
-    Prefer the url from categories response if present.
-    Otherwise, try to build from category_id like "bestsellers_17871150011".
+    Build a Best Sellers URL from a STANDARD category node id.
     """
-    if cat_obj and isinstance(cat_obj, dict):
-        u = cat_obj.get("url")
-        if isinstance(u, str) and u.startswith("http"):
-            return u
+    if not cat_obj or not isinstance(cat_obj, dict):
+        return None
 
-        cid = cat_obj.get("id") or cat_obj.get("category_id")
-        if isinstance(cid, str) and "bestsellers_" in cid:
-            node = cid.split("bestsellers_", 1)[1]
-            node = re.sub(r"[^\d]", "", node)  # digits only
-            if node:
-                return f"https://www.{amazon_domain}/Best-Sellers/zgbs/?node={node}"
+    # If API returns a URL, prefer it
+    u = cat_obj.get("url")
+    if isinstance(u, str) and u.startswith("http"):
+        return u
+
+    cid = str(cat_obj.get("id") or "").strip()
+    cid_digits = re.sub(r"[^\d]", "", cid)
+    if cid_digits:
+        return f"https://www.{amazon_domain}/Best-Sellers/zgbs/?node={cid_digits}"
 
     return None
 
@@ -595,7 +600,7 @@ if do_cat_search:
         cat_error_box.error("Missing RAINFOREST_API_KEY in Streamlit Secrets.")
     else:
         try:
-            cats = categories_search_bestsellers(amazon_domain, cat_search_term, force_refresh=force_refresh)
+            cats = categories_search_standard(amazon_domain, cat_search_term, force_refresh=force_refresh)
             if not cats:
                 st.session_state["category_results"] = []
                 cat_error_box.warning("No categories found. Try a different search term.")
