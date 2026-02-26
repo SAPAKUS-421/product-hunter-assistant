@@ -189,7 +189,21 @@ def cache_key(url: str, params: Dict[str, Any]) -> str:
     parts = [url] + [f"{k}={params[k]}" for k in sorted(params.keys())]
     return "||".join(parts)
 
+def redact_api_key(text: str) -> str:
+    """Redact api_key=... inside any URL/text."""
+    if not text:
+        return text
+    return re.sub(r"(api_key=)([^&\s]+)", r"\1****REDACTED****", text)
 
+
+def safe_cache_key(url: str, params: Dict[str, Any]) -> str:
+    """Cache key without storing sensitive api_key value."""
+    safe_params = dict(params)
+    if "api_key" in safe_params:
+        safe_params["api_key"] = "REDACTED"
+    parts = [url] + [f"{k}={safe_params[k]}" for k in sorted(safe_params.keys())]
+    return "||".join(parts)
+    
 def rainforest_get_json(
     endpoint: str,
     params: Dict[str, Any],
@@ -207,20 +221,78 @@ def rainforest_get_json(
     if "api_key" not in params2:
         params2["api_key"] = RAINFOREST_API_KEY
 
-    key = cache_key(url, params2)
+    key = safe_cache_key(url, params2)
     if not force_refresh and key in st.session_state["api_cache"]:
         _, cached = st.session_state["api_cache"][key]
         return cached
 
+    def rainforest_get_json(
+    endpoint: str,
+    params: Dict[str, Any],
+    force_refresh: bool,
+    count_request: bool = True,
+    timeout: int = 30,
+) -> Dict[str, Any]:
+    """
+    Safe Rainforest caller:
+    - Never leaks api_key in error messages
+    - Detects 'temporarily suspended' messages and shows a clean instruction
+    - Uses in-session cache without storing real api_key in cache key
+    """
+    url = f"{RAINFOREST_BASE}{endpoint}"
+    params2 = dict(params)
+
+    if "api_key" not in params2:
+        params2["api_key"] = RAINFOREST_API_KEY
+
+    # Use SAFE cache key (redacts api_key)
+    key = safe_cache_key(url, params2)
+    if not force_refresh and key in st.session_state["api_cache"]:
+        _, cached = st.session_state["api_cache"][key]
+        return cached
+
+    try:
     r = requests.get(url, params=params2, timeout=timeout)
-    r.raise_for_status()
+except requests.RequestException as e:
+    raise RuntimeError(f"Network error contacting Rainforest: {e.__class__.__name__}")
+
+# Try to parse JSON even on HTTP errors
+data = None
+try:
     data = r.json()
+except Exception:
+    data = None
 
-    st.session_state["api_cache"][key] = (time.time(), data)
-    if count_request:
-        st.session_state["requests_used"] += 1
-    return data
+# If Rainforest returns structured request_info, use it
+if isinstance(data, dict) and "request_info" in data:
+    ri = data.get("request_info") or {}
+    success = ri.get("success", True)
+    msg = str(ri.get("message") or "").strip()
 
+    if success is False:
+        lower = msg.lower()
+
+        if "temporarily suspended" in lower:
+            raise RuntimeError(
+                "Rainforest says your account is temporarily suspended. "
+                "Open Rainforest Dashboard → API Playground to confirm, then contact support to reinstate."
+            )
+
+        # Generic structured error
+        raise RuntimeError(f"Rainforest error: {redact_api_key(msg)}")
+
+# If still an HTTP error and no structured JSON, raise a redacted URL error
+if r.status_code >= 400:
+    raise RuntimeError(f"Rainforest HTTP {r.status_code}. URL: {redact_api_key(r.url)}")
+
+# Success path
+if not isinstance(data, dict):
+    data = {}
+
+st.session_state["api_cache"][key] = (time.time(), data)
+if count_request:
+    st.session_state["requests_used"] += 1
+return data
 
 def estimate_requests_scan(
     scan_mode: str,
@@ -567,7 +639,7 @@ if do_cat_search:
                 cat_error_box.success(f"Found {len(cats)} category matches.")
         except Exception as e:
             st.session_state["category_results"] = []
-            cat_error_box.error(f"Category search failed: {e}")
+            cat_error_box.error(f"Category search failed: {redact_api_key(str(e))}")
 
 # Build selectbox options safely (show full id so duplicates don’t look identical)
 def cat_label(c: Dict[str, Any]) -> str:
@@ -940,7 +1012,7 @@ with tabs[0]:
                     )
 
             except Exception as e:
-                st.error(f"Scan failed: {e}")
+                st.error(f"Scan failed: {redact_api_key(str(e))}")
                 st.session_state["last_df"] = None
     else:
         st.info("Click **Run scan** to generate results.")
@@ -992,7 +1064,7 @@ with tabs[1]:
                     st.session_state["my_shortlist"] = idf.to_dict(orient="records")
                     st.success(f"Imported {len(idf)} rows into My Shortlist.")
                 except Exception as e:
-                    st.error(f"Import failed: {e}")
+                    st.error(redact_api_key(str(e)))
 
 
 with tabs[2]:
